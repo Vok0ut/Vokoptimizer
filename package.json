@@ -1,0 +1,65 @@
+{
+  "name": "vokoptimizer",
+  "version": "4.2.0",
+  "description": "Vokoptimizer - Real System Optimizer for Windows",
+  "main": "main.js",
+  "author": "Vokoptimizer",
+  "license": "MIT",
+  "scripts": {
+    "build:renderer": "node esbuild.config.js",
+    "dev:renderer": "node esbuild.config.js --watch",
+    "start": "node esbuild.config.js && electron .",
+    "build": "node esbuild.config.js && electron-builder --win",
+    "build-portable": "node esbuild.config.js && electron-builder --win portable",
+    "build-installer": "node esbuild.config.js && electron-builder --win nsis"
+  },
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^24.13.3",
+    "esbuild": "^0.24.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "build": {
+    "appId": "com.vokoptimizer.app",
+    "productName": "Vokoptimizer",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/index.html",
+      "src/app.bundle.js",
+      "src/fonts/**/*",
+      "icon.ico"
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "icon": "icon.ico",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "portable": {
+      "artifactName": "Vokoptimizer-${version}-Portable.exe",
+      "requestExecutionLevel": "admin"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Vokoptimizer",
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
+      "uninstallDisplayName": "Vokoptimizer",
+      "artifactName": "Vokoptimizer-${version}-Setup.exe"
+    }
+  },
+  "dependencies": {
+    "systeminformation": "^5.31.7"
+  }
+}

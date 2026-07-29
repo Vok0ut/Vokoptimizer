@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:;"/>
+<title>Vokoptimizer</title>
+<style>
+  @font-face{
+    font-family:'JetBrains Mono';
+    src:url('fonts/jbm.woff2') format('woff2');
+    font-weight:100 800;
+    font-style:normal;
+    font-display:swap;
+  }
+  :root { --bg:#000;--fg:#f2f2f2;--mono:'JetBrains Mono',ui-monospace,Consolas,'Courier New',monospace; }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  html,body,#root{height:100%;overflow:hidden;background:#000;color:#f2f2f2;font-family:var(--mono);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased;font-weight:500}
+  button{font-family:var(--mono);cursor:pointer;font-weight:500}
+  button:disabled{cursor:default}
+  button:focus-visible{outline:1px solid #fff;outline-offset:2px}
+  select{font-family:var(--mono);background:#000;color:#d8d8d8;border:1px solid #3a3a3a;font-size:10px;padding:4px 7px;outline:none;cursor:pointer;transition:border-color .12s}
+  select:hover{border-color:#6a6a6a}
+  select:focus{border-color:#9a9a9a}
+  ::selection{background:#fff;color:#000}
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-track{background:#000}
+  ::-webkit-scrollbar-thumb{background:#2e2e2e;border-radius:3px}
+  ::-webkit-scrollbar-thumb:hover{background:#4a4a4a}
+  .btn-pri:not(:disabled):hover{background:#fff !important;color:#000 !important;border-color:#fff !important}
+  .btn-ghost:not(:disabled):hover{color:#fff !important;border-color:#9a9a9a !important}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+  @keyframes scanline{0%{top:-4px}100%{top:100%}}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  @keyframes glitch{0%,100%{transform:none;opacity:1}92%{transform:none;opacity:1}93%{transform:translateX(-6px);opacity:.8}94%{transform:translateX(6px);opacity:.8}95%{transform:none;opacity:1}97%{transform:translateX(4px);opacity:.7}98%{transform:none;opacity:1}}
+  @keyframes slideIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+  @keyframes rowIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+  @keyframes nodeIn{from{opacity:0;transform:translate(-50%,-50%) scale(.45)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+  @keyframes floatY{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+  @keyframes barSlide{0%{left:-35%}100%{left:105%}}
+  @keyframes checkPop{from{transform:scale(.3);opacity:0}to{transform:scale(1);opacity:1}}
+  .blink{animation:blink 1.2s step-end infinite}
+  .fade-in{animation:fadeIn .28s cubic-bezier(.2,.8,.2,1) forwards}
+  .row-in{opacity:0;animation:rowIn .32s cubic-bezier(.2,.8,.2,1) forwards;animation-delay:calc(var(--i,0)*26ms)}
+  .check-pop{display:inline-block;animation:checkPop .25s cubic-bezier(.2,.8,.2,1)}
+  .scanbar{position:relative;height:2px;background:#1c1c1c;overflow:hidden}
+  .scanbar::after{content:'';position:absolute;top:0;width:32%;height:100%;background:#fff;animation:barSlide 1.15s cubic-bezier(.45,.05,.55,.95) infinite}
+  .spinner{display:inline-block;width:10px;height:10px;border:1.5px solid #3a3a3a;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="app.bundle.js"></script>
+</body>
+</html>

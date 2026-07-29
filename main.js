@@ -1,0 +1,910 @@
+const { app, BrowserWindow, Menu, Tray, shell, ipcMain } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+const { exec, execFile, spawn } = require('child_process');
+const si = require('systeminformation');
+
+app.disableHardwareAcceleration();
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) { app.quit(); }
+let mainWindow = null;
+let tray = null;
+
+const IS_WIN = process.platform === 'win32';
+const ICON_PATH = path.join(__dirname, 'icon.ico');
+const HISTORY_FILE = path.join(app.getPath('userData'), 'vok-history.json');
+const SETTINGS_FILE = path.join(app.getPath('userData'), 'vok-settings.json');
+const BACKUP_DIR = path.join(app.getPath('userData'), 'backups');
+
+/* ─── Settings (window bounds, etc.) ────────────────────────────── */
+function loadSettings() {
+  try { return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8')); } catch (e) { return {}; }
+}
+function saveSettings(patch) {
+  try {
+    const cur = loadSettings();
+    fs.writeFileSync(SETTINGS_FILE, JSON.stringify({ ...cur, ...patch }));
+  } catch (e) {}
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PowerShell helper — robust, no quoting hell (Base64 EncodedCommand)
+   ═══════════════════════════════════════════════════════════════════ */
+function ps(script, { timeout = 20000 } = {}) {
+  return new Promise(resolve => {
+    if (!IS_WIN) { resolve({ err: new Error('not windows'), stdout: '', stderr: '' }); return; }
+    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    execFile('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+      { timeout, maxBuffer: 1024 * 1024 * 96, windowsHide: true },
+      (err, stdout, stderr) => resolve({ err, stdout: (stdout || '').trim(), stderr: (stderr || '').trim() })
+    );
+  });
+}
+async function psJson(script, opts) {
+  const r = await ps(script, opts);
+  if (!r.stdout) return null;
+  try { return JSON.parse(r.stdout); } catch (e) { return null; }
+}
+const asArray = v => (v == null ? [] : Array.isArray(v) ? v : [v]);
+
+/* ═══════════════════════════════════════════════════════════════════
+   History persistence
+   ═══════════════════════════════════════════════════════════════════ */
+function loadHistory() {
+  try { return JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); } catch (e) { return []; }
+}
+function addHistory(op, detail, opts = {}) {
+  try {
+    const h = loadHistory();
+    h.unshift({ ts: Date.now(), op, detail, freed: opts.freed || 0, status: opts.status || 'OK', durationMs: opts.durationMs || 0 });
+    fs.writeFileSync(HISTORY_FILE, JSON.stringify(h.slice(0, 300)));
+  } catch (e) {}
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   ADMIN detection / elevation
+   ═══════════════════════════════════════════════════════════════════ */
+let isAdmin = false;
+async function checkAdmin() {
+  if (!IS_WIN) { isAdmin = false; return false; }
+  const r = await ps('([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)', { timeout: 6000 });
+  isAdmin = /true/i.test(r.stdout);
+  return isAdmin;
+}
+
+ipcMain.handle('is-admin', async () => isAdmin);
+
+// Spawn an elevated copy of the app. Resolves true if the elevated process
+// actually started (UAC accepted), false if the user cancelled the prompt.
+// For the portable build, relaunch the ORIGINAL portable exe (a fresh
+// extraction): the launcher deletes this instance's temp dir on exit, and the
+// single-instance lock is released so the new copy isn't rejected.
+function elevate() {
+  return new Promise(resolve => {
+    if (!IS_WIN) { resolve(false); return; }
+    try { app.releaseSingleInstanceLock(); } catch (e) {}
+    const exe = (process.env.PORTABLE_EXECUTABLE_FILE || process.execPath).replace(/'/g, "''");
+    const args = app.isPackaged ? ['--elevated'] : [path.resolve(__dirname), '--elevated'];
+    const argList = args.map(a => `'${a.replace(/'/g, "''")}'`).join(',');
+    const cmd = `try { Start-Process -FilePath '${exe}' -ArgumentList ${argList} -Verb RunAs -ErrorAction Stop; 'OK' } catch { 'CANCEL' }`;
+    const encoded = Buffer.from(cmd, 'utf16le').toString('base64');
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      { windowsHide: true, timeout: 120000 },
+      (err, stdout) => resolve(/OK/.test(stdout || '')));
+  });
+}
+
+ipcMain.handle('relaunch-admin', async () => {
+  if (!IS_WIN) return { ok: false };
+  const launched = await elevate();
+  if (launched) { app.isQuiting = true; setTimeout(() => app.quit(), 300); return { ok: true }; }
+  return { ok: false, error: 'Elevación cancelada' };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   REAL-TIME METRICS  (systeminformation + one PS call for GPU/temp/threads)
+   ═══════════════════════════════════════════════════════════════════ */
+function fmtUptime(sec) {
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
+  return d > 0 ? `${d}d ${h}h` : `${h}h ${m}m`;
+}
+
+async function gpuTempThreads() {
+  if (!IS_WIN) return { gpu: -1, temp: -1, threads: 0 };
+  const script = `
+$gpu = -1
+try { $s = (Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; if ($s) { $gpu = [math]::Round((($s | Measure-Object CookedValue -Sum).Sum), 0) } } catch {}
+$temp = -1
+try { $t = Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi -ErrorAction SilentlyContinue; if ($t) { $temp = [math]::Round((($t[0].CurrentTemperature) - 2732) / 10, 0) } } catch {}
+$threads = 0
+try { $threads = (Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $_.Threads.Count } | Measure-Object -Sum).Sum } catch {}
+Write-Output "$gpu|$temp|$threads"`;
+  const r = await ps(script, { timeout: 6000 });
+  const p = (r.stdout || '').split('|');
+  return { gpu: parseInt(p[0]), temp: parseInt(p[1]), threads: parseInt(p[2]) || 0 };
+}
+
+ipcMain.handle('get-metrics', async () => {
+  try {
+    const [load, mem, fsSize, net, procs, speed, time, gtt] = await Promise.all([
+      si.currentLoad().catch(() => ({ currentLoad: 0 })),
+      si.mem().catch(() => ({ total: os.totalmem(), available: os.freemem() })),
+      si.fsSize().catch(() => []),
+      si.networkStats().catch(() => []),
+      si.processes().catch(() => ({ all: 0, list: [] })),
+      si.cpuCurrentSpeed().catch(() => ({ avg: 0 })),
+      si.time(),
+      gpuTempThreads(),
+    ]);
+
+    const total = mem.total || os.totalmem();
+    const available = mem.available != null ? mem.available : os.freemem();
+    const used = total - available;
+
+    const sysDrive = (process.env.SystemDrive || 'C:').replace('\\', '');
+    let diskPct = 0;
+    const sys = fsSize.find(d => (d.mount || '').toUpperCase().startsWith(sysDrive.toUpperCase())) || fsSize[0];
+    if (sys && sys.size) diskPct = Math.round(sys.use != null ? sys.use : ((sys.used / sys.size) * 100));
+
+    const netMbps = +(net.reduce((s, n) => s + (n.rx_sec || 0) + (n.tx_sec || 0), 0) / 1048576).toFixed(1);
+
+    const topProcs = (procs.list || [])
+      .sort((a, b) => (b.memRss || b.mem_rss || 0) - (a.memRss || a.mem_rss || 0))
+      .slice(0, 6)
+      .map(p => ({ Name: p.name, CPU: +(p.cpu || 0).toFixed(1), MemMB: Math.round((p.memRss || p.mem_rss || 0) / 1024), pid: p.pid }));
+
+    return {
+      cpu: Math.round(load.currentLoad || 0),
+      ram: {
+        totalGB: +(total / 1073741824).toFixed(1),
+        usedGB: +(used / 1073741824).toFixed(1),
+        freeGB: +(available / 1073741824).toFixed(1),
+        pct: Math.round((used / total) * 100),
+      },
+      ext: {
+        gpu: gtt.gpu, temp: gtt.temp, diskPct,
+        netMbps: isNaN(netMbps) ? 0 : netMbps,
+        procs: procs.all || (procs.list ? procs.list.length : 0),
+        threads: gtt.threads,
+        cpuFreq: +(speed.avg || 0).toFixed(2),
+        uptime: fmtUptime(time.uptime || 0),
+      },
+      topProcs,
+    };
+  } catch (e) {
+    return { cpu: 0, ram: { totalGB: 0, usedGB: 0, freeGB: 0, pct: 0 }, ext: { gpu: -1, temp: -1, diskPct: 0, netMbps: 0, procs: 0, threads: 0, cpuFreq: 0, uptime: '—' }, topProcs: [] };
+  }
+});
+
+ipcMain.handle('get-system-info', async () => {
+  try {
+    const [cpu, gfx, osInfo, sys, disks, bat] = await Promise.all([
+      si.cpu().catch(() => ({})), si.graphics().catch(() => ({ controllers: [] })),
+      si.osInfo().catch(() => ({})), si.system().catch(() => ({})),
+      si.diskLayout().catch(() => []), si.battery().catch(() => ({ hasBattery: false })),
+    ]);
+    const gpu = (gfx.controllers || []).map(c => c.model).filter(Boolean)[0] || '—';
+    return {
+      cpu: `${cpu.manufacturer || ''} ${cpu.brand || ''}`.trim() || '—',
+      cores: `${cpu.physicalCores || cpu.cores || '?'}C / ${cpu.cores || '?'}T`,
+      gpu,
+      os: `${osInfo.distro || ''} ${osInfo.release || ''} (build ${osInfo.build || '?'})`.trim(),
+      arch: osInfo.arch || '',
+      board: `${sys.manufacturer || ''} ${sys.model || ''}`.trim() || '—',
+      disk: (disks[0] && `${disks[0].name || ''} ${disks[0].type || ''}`.trim()) || '—',
+      ramGB: +(os.totalmem() / 1073741824).toFixed(0),
+      battery: bat.hasBattery ? `${bat.percent}%${bat.isCharging ? ' (cargando)' : ''}` : 'N/A',
+      hostname: osInfo.hostname || os.hostname(),
+    };
+  } catch (e) { return {}; }
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   DISK CLEANUP — real scan (sizes/counts) + real clean
+   ═══════════════════════════════════════════════════════════════════ */
+const JUNK_CATS = [
+  { id: 'temp_user', label: 'Temporales del usuario', risk: 'SEGURO' },
+  { id: 'temp_win', label: 'Temporales de Windows', risk: 'SEGURO' },
+  { id: 'recycle', label: 'Papelera de reciclaje', risk: 'SEGURO' },
+  { id: 'thumbs', label: 'Miniaturas (thumbcache)', risk: 'SEGURO' },
+  { id: 'browser', label: 'Caché de navegadores', risk: 'SEGURO' },
+  { id: 'wer', label: 'Reportes de errores (WER)', risk: 'SEGURO' },
+  { id: 'dumps', label: 'Volcados de memoria', risk: 'SEGURO' },
+  { id: 'delivery', label: 'Delivery Optimization', risk: 'SEGURO' },
+  { id: 'winupdate', label: 'Caché de Windows Update', risk: 'REVISAR' },
+  { id: 'prefetch', label: 'Prefetch de Windows', risk: 'REVISAR' },
+];
+
+// PowerShell that resolves the path list for each category (kept in one place)
+const PS_JUNK_PATHS = `
+function P($id) {
+  switch ($id) {
+    'temp_user'  { return @($env:TEMP, "$env:LOCALAPPDATA\\Temp") }
+    'temp_win'   { return @("$env:SystemRoot\\Temp") }
+    'thumbs'     { return @("$env:LOCALAPPDATA\\Microsoft\\Windows\\Explorer\\thumbcache_*.db", "$env:LOCALAPPDATA\\Microsoft\\Windows\\Explorer\\iconcache_*.db") }
+    'browser'    { return @(
+        "$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\Cache",
+        "$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\Code Cache",
+        "$env:LOCALAPPDATA\\Microsoft\\Edge\\User Data\\Default\\Cache",
+        "$env:LOCALAPPDATA\\Microsoft\\Edge\\User Data\\Default\\Code Cache",
+        "$env:LOCALAPPDATA\\Mozilla\\Firefox\\Profiles") }
+    'wer'        { return @("$env:ProgramData\\Microsoft\\Windows\\WER\\ReportQueue", "$env:ProgramData\\Microsoft\\Windows\\WER\\ReportArchive", "$env:LOCALAPPDATA\\Microsoft\\Windows\\WER") }
+    'dumps'      { return @("$env:SystemRoot\\Minidump", "$env:LOCALAPPDATA\\CrashDumps") }
+    'delivery'   { return @("$env:SystemRoot\\SoftwareDistribution\\DeliveryOptimization") }
+    'winupdate'  { return @("$env:SystemRoot\\SoftwareDistribution\\Download") }
+    'prefetch'   { return @("$env:SystemRoot\\Prefetch") }
+  }
+  return @()
+}`;
+
+ipcMain.handle('scan-junk', async () => {
+  const ids = JUNK_CATS.map(c => c.id);
+  const script = `
+${PS_JUNK_PATHS}
+$ids = @(${ids.map(i => `'${i}'`).join(',')})
+$out = @()
+foreach ($id in $ids) {
+  $size = [int64]0; $count = 0
+  if ($id -eq 'recycle') {
+    try {
+      $sh = New-Object -ComObject Shell.Application
+      $rb = $sh.Namespace(10)
+      if ($rb) { foreach ($it in $rb.Items()) { try { $size += [int64]$it.Size; $count++ } catch {} } }
+    } catch {}
+  } else {
+    foreach ($p in (P $id)) {
+      try {
+        if ($p -like '*[*]*') {
+          Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | ForEach-Object { $size += [int64]$_.Length; $count++ }
+        } elseif (Test-Path -LiteralPath $p) {
+          Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object { $size += [int64]$_.Length; $count++ }
+        }
+      } catch {}
+    }
+  }
+  $out += [pscustomobject]@{ id = $id; size = $size; count = $count }
+}
+$out | ConvertTo-Json -Compress`;
+  const data = await psJson(script, { timeout: 60000 });
+  const byId = {};
+  asArray(data).forEach(d => { byId[d.id] = d; });
+  return JUNK_CATS.map(c => ({
+    ...c,
+    sizeBytes: (byId[c.id] && byId[c.id].size) || 0,
+    count: (byId[c.id] && byId[c.id].count) || 0,
+  }));
+});
+
+ipcMain.handle('clean-junk', async (e, selectedIds) => {
+  if (!IS_WIN) return { ok: false, freed: 0 };
+  const t0 = Date.now();
+  const ids = (selectedIds || []).filter(id => JUNK_CATS.some(c => c.id === id));
+  const script = `
+${PS_JUNK_PATHS}
+$ids = @(${ids.map(i => `'${i}'`).join(',')})
+$freed = [int64]0
+foreach ($id in $ids) {
+  if ($id -eq 'recycle') {
+    try { Clear-RecycleBin -Force -ErrorAction SilentlyContinue } catch {}
+    continue
+  }
+  foreach ($p in (P $id)) {
+    try {
+      if ($p -like '*[*]*') {
+        Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | ForEach-Object {
+          try { $freed += [int64]$_.Length; Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
+        }
+      } elseif (Test-Path -LiteralPath $p) {
+        Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+          try { $freed += [int64]$_.Length; Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        Get-ChildItem -LiteralPath $p -Recurse -Force -Directory -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object {
+          try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+        }
+      }
+    } catch {}
+  }
+}
+Write-Output $freed`;
+  const r = await ps(script, { timeout: 120000 });
+  const freed = parseInt((r.stdout || '0').trim()) || 0;
+  addHistory('Limpieza de archivos', `${ids.length} categorías`, { freed, durationMs: Date.now() - t0 });
+  return { ok: true, freed };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   SERVICES — real list + start/stop + startup type
+   ═══════════════════════════════════════════════════════════════════ */
+// Curated, well-known optimizable services. impact = how much you typically gain by stopping.
+const SVC_META = {
+  SysMain:        { label: 'SysMain (Superfetch)',     impact: 'ALTO',  safe: true,  desc: 'Precarga apps; útil con HDD, poco con SSD' },
+  WSearch:        { label: 'Windows Search',           impact: 'ALTO',  safe: true,  desc: 'Indexado de archivos' },
+  DiagTrack:      { label: 'Telemetría (DiagTrack)',   impact: 'MEDIO', safe: true,  desc: 'Datos de diagnóstico a Microsoft' },
+  wuauserv:       { label: 'Windows Update',           impact: 'MEDIO', safe: false, desc: 'Actualizaciones de seguridad' },
+  Spooler:        { label: 'Cola de impresión',        impact: 'BAJO',  safe: true,  desc: 'Necesario solo si imprimes' },
+  XblAuthManager: { label: 'Xbox Live Auth',           impact: 'BAJO',  safe: true,  desc: 'Servicios de Xbox' },
+  XboxNetApiSvc:  { label: 'Xbox Networking',          impact: 'BAJO',  safe: true,  desc: 'Red de Xbox' },
+  MapsBroker:     { label: 'Mapas descargados',        impact: 'BAJO',  safe: true,  desc: 'Mapas sin conexión' },
+  RemoteRegistry: { label: 'Registro remoto',          impact: 'BAJO',  safe: true,  desc: 'Riesgo de seguridad; mejor desactivado' },
+  Fax:            { label: 'Fax',                       impact: 'BAJO',  safe: true,  desc: 'Servicio de fax' },
+  WMPNetworkSvc:  { label: 'Uso compartido WMP',        impact: 'BAJO',  safe: true,  desc: 'Compartir multimedia de WMP' },
+  RetailDemo:     { label: 'Modo demo (tienda)',       impact: 'BAJO',  safe: true,  desc: 'Solo equipos de exposición' },
+  lfsvc:          { label: 'Geolocalización',          impact: 'BAJO',  safe: true,  desc: 'Servicio de ubicación' },
+  CDPSvc:         { label: 'Connected Devices',        impact: 'BAJO',  safe: true,  desc: 'Sincronización entre dispositivos' },
+};
+
+ipcMain.handle('list-services', async () => {
+  const names = Object.keys(SVC_META);
+  const script = `
+$names = @(${names.map(n => `'${n}'`).join(',')})
+Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.Name } |
+  Select-Object Name, DisplayName, State, StartMode | ConvertTo-Json -Compress`;
+  const data = asArray(await psJson(script, { timeout: 15000 }));
+  return names.map(n => {
+    const row = data.find(d => d.Name === n) || {};
+    const meta = SVC_META[n];
+    return {
+      name: n,
+      label: meta.label,
+      display: row.DisplayName || meta.label,
+      state: row.State || 'Desconocido',
+      startMode: row.StartMode || '—',
+      impact: meta.impact,
+      safe: meta.safe,
+      desc: meta.desc,
+      present: !!row.Name,
+    };
+  }).filter(s => s.present);
+});
+
+ipcMain.handle('set-service', async (e, name, action) => {
+  if (!IS_WIN) return { ok: false };
+  if (!SVC_META[name]) return { ok: false, error: 'Servicio no permitido' };
+  let cmd = '';
+  if (action === 'start') cmd = `Start-Service -Name '${name}' -ErrorAction Stop`;
+  else if (action === 'stop') cmd = `Stop-Service -Name '${name}' -Force -ErrorAction Stop`;
+  else if (action === 'disable') cmd = `Stop-Service -Name '${name}' -Force -ErrorAction SilentlyContinue; Set-Service -Name '${name}' -StartupType Disabled -ErrorAction Stop`;
+  else if (action === 'manual') cmd = `Set-Service -Name '${name}' -StartupType Manual -ErrorAction Stop`;
+  else if (action === 'auto') cmd = `Set-Service -Name '${name}' -StartupType Automatic -ErrorAction Stop`;
+  else return { ok: false, error: 'Acción inválida' };
+  const r = await ps(`try { ${cmd}; Write-Output 'OK' } catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout: 15000 });
+  if (/^OK/.test(r.stdout)) { addHistory('Servicio', `${name} → ${action}`); return { ok: true }; }
+  const msg = (r.stdout || r.stderr || '').replace(/^ERR:/, '');
+  return { ok: false, error: msg || (isAdmin ? 'Falló la operación' : 'Requiere administrador') };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   STARTUP MANAGER — real list + reversible enable/disable (StartupApproved)
+   ═══════════════════════════════════════════════════════════════════ */
+ipcMain.handle('list-startup', async () => {
+  const script = `
+$result = New-Object System.Collections.ArrayList
+function Approved-Enabled($apPath, $name) {
+  try {
+    $v = (Get-ItemProperty -LiteralPath $apPath -Name $name -ErrorAction Stop).$name
+    if ($v -and ($v[0] -band 1)) { return $false }
+  } catch {}
+  return $true
+}
+$runs = @(
+  @{ hive='HKCU'; run='HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'; ap='HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run' },
+  @{ hive='HKLM'; run='HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'; ap='HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run' }
+)
+foreach ($rk in $runs) {
+  if (Test-Path $rk.run) {
+    $props = Get-ItemProperty -Path $rk.run
+    foreach ($pr in $props.PSObject.Properties) {
+      if ($pr.Name -like 'PS*') { continue }
+      $en = Approved-Enabled $rk.ap $pr.Name
+      [void]$result.Add([pscustomobject]@{ name=$pr.Name; command=[string]$pr.Value; location=$rk.hive; source='Run'; approvedName=$pr.Name; enabled=$en })
+    }
+  }
+}
+$folders = @(
+  @{ dir="$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"; hive='HKCU' },
+  @{ dir="$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"; hive='HKLM' }
+)
+$apFolderCU = 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder'
+$apFolderLM = 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\StartupFolder'
+foreach ($f in $folders) {
+  if (Test-Path $f.dir) {
+    Get-ChildItem -Path $f.dir -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {
+      $ap = if ($f.hive -eq 'HKCU') { $apFolderCU } else { $apFolderLM }
+      $en = Approved-Enabled $ap $_.Name
+      [void]$result.Add([pscustomobject]@{ name=$_.BaseName; command=$_.FullName; location=$f.hive; source='Folder'; approvedName=$_.Name; enabled=$en })
+    }
+  }
+}
+$result | ConvertTo-Json -Compress`;
+  return asArray(await psJson(script, { timeout: 15000 }));
+});
+
+ipcMain.handle('toggle-startup', async (e, item, enable) => {
+  if (!IS_WIN) return { ok: false };
+  const base = item.location === 'HKLM'
+    ? 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved'
+    : 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved';
+  const sub = item.source === 'Folder' ? 'StartupFolder' : 'Run';
+  const apPath = `${base}\\${sub}`;
+  const bytes = enable ? '2,0,0,0,0,0,0,0,0,0,0,0' : '3,0,0,0,0,0,0,0,0,0,0,0';
+  const safeName = (item.approvedName || item.name).replace(/'/g, "''");
+  const script = `
+try {
+  if (-not (Test-Path '${apPath}')) { New-Item -Path '${apPath}' -Force | Out-Null }
+  $b = [byte[]]@(${bytes})
+  Set-ItemProperty -Path '${apPath}' -Name '${safeName}' -Value $b -Type Binary -ErrorAction Stop
+  Write-Output 'OK'
+} catch { Write-Output ('ERR:' + $_.Exception.Message) }`;
+  const r = await ps(script, { timeout: 10000 });
+  if (/^OK/.test(r.stdout)) { addHistory('Arranque', `${item.name} → ${enable ? 'activado' : 'desactivado'}`); return { ok: true }; }
+  return { ok: false, error: (r.stdout || '').replace(/^ERR:/, '') || (item.location === 'HKLM' && !isAdmin ? 'Requiere administrador' : 'Falló') };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   RAM OPTIMIZATION — real working-set trim (EmptyWorkingSet)
+   ═══════════════════════════════════════════════════════════════════ */
+async function memAvailable() {
+  try { const m = await si.mem(); return m.available; } catch (e) { return os.freemem(); }
+}
+
+ipcMain.handle('free-ram', async () => {
+  if (!IS_WIN) return { ok: false, freed: 0 };
+  const before = await memAvailable();
+  const script = `
+$sig = @"
+using System;
+using System.Runtime.InteropServices;
+public class VokMem { [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr hProcess); }
+"@
+try { Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue } catch {}
+$n = 0
+Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
+  try { [void][VokMem]::EmptyWorkingSet($_.Handle); $n++ } catch {}
+}
+[System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+Write-Output $n`;
+  const r = await ps(script, { timeout: 30000 });
+  await new Promise(res => setTimeout(res, 600));
+  const after = await memAvailable();
+  const freed = Math.max(0, after - before);
+  addHistory('Liberar RAM', `${parseInt(r.stdout) || 0} procesos`, { freed });
+  return { ok: true, freed, procs: parseInt(r.stdout) || 0 };
+});
+
+ipcMain.handle('kill-process', async (e, pid) => {
+  if (!IS_WIN || !pid) return { ok: false };
+  const r = await ps(`try { Stop-Process -Id ${parseInt(pid)} -Force -ErrorAction Stop; Write-Output 'OK' } catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout: 8000 });
+  return /^OK/.test(r.stdout) ? { ok: true } : { ok: false, error: (r.stdout || '').replace(/^ERR:/, '') };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   POWER PROFILES / GAME / QUIET MODE
+   ═══════════════════════════════════════════════════════════════════ */
+const POWER_GUIDS = {
+  gaming: '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c',
+  trabajo: 'a1841308-3541-4fab-bc81-f71556f20b4a',
+  balanced: '381b4222-f694-41f0-9685-ff5bb260df2e',
+  ultimate: 'e9a42b02-d5df-448d-aa00-03f14749eb61',
+};
+
+function execAsync(cmd, timeout = 12000) {
+  return new Promise(resolve => exec(cmd, { timeout, windowsHide: true }, (err) => resolve(!err)));
+}
+
+function execOut(cmd, timeout = 12000) {
+  return new Promise(resolve => exec(cmd, { timeout, windowsHide: true }, (err, stdout) => resolve({ ok: !err, stdout: stdout || '' })));
+}
+
+ipcMain.handle('set-power-profile', async (e, profile) => {
+  if (!IS_WIN) return { ok: false };
+  let guid = POWER_GUIDS[profile] || POWER_GUIDS.balanced;
+  // The Ultimate Performance plan often isn't registered; duplicating it registers it (and may assign a new GUID).
+  if (profile === 'ultimate') {
+    const dup = await execOut(`powercfg -duplicatescheme ${POWER_GUIDS.ultimate}`);
+    const m = dup.stdout.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+    if (m) guid = m[1];
+  }
+  const ok = await execAsync(`powercfg /setactive ${guid}`);
+  addHistory('Plan de energía', profile);
+  return { ok };
+});
+
+// Multimedia class scheduler keys — the real Windows latency knobs.
+const MMCSS = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile';
+const MMCSS_GAMES = MMCSS + '\\Tasks\\Games';
+
+async function psOk(script) {
+  const r = await ps(`try { ${script}; Write-Output 'OK' } catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout: 15000 });
+  return /OK/.test(r.stdout);
+}
+
+// Applies a full optimization profile and reports each step's outcome.
+async function applyProfile(id) {
+  if (!IS_WIN) return { ok: false, steps: [] };
+  const steps = [];
+  const run = async (label, fn) => { let ok = false; try { ok = (await fn()) !== false; } catch (e) { ok = false; } steps.push({ label, ok }); };
+
+  if (id === 'gaming') {
+    await run('Plan de energía: Alto rendimiento', () => execAsync(`powercfg /setactive ${POWER_GUIDS.gaming}`));
+    await run('Prioridad multimedia máxima', () => psOk(
+      `Set-ItemProperty -Path '${MMCSS}' -Name SystemResponsiveness -Value 10 -Type DWord -ErrorAction Stop`));
+    await run('Red sin throttling (latencia mínima)', () => psOk(
+      `Set-ItemProperty -Path '${MMCSS}' -Name NetworkThrottlingIndex -Value 0xffffffff -Type DWord -ErrorAction Stop`));
+    await run('Prioridad GPU/CPU alta para juegos', () => psOk(`
+if (-not (Test-Path '${MMCSS_GAMES}')) { New-Item -Path '${MMCSS_GAMES}' -Force | Out-Null }
+Set-ItemProperty -Path '${MMCSS_GAMES}' -Name 'GPU Priority' -Value 8 -Type DWord -ErrorAction Stop
+Set-ItemProperty -Path '${MMCSS_GAMES}' -Name 'Priority' -Value 6 -Type DWord -ErrorAction Stop
+Set-ItemProperty -Path '${MMCSS_GAMES}' -Name 'Scheduling Category' -Value 'High' -ErrorAction Stop
+Set-ItemProperty -Path '${MMCSS_GAMES}' -Name 'SFIO Priority' -Value 'High' -ErrorAction Stop`));
+    await run('Game Mode ON · captura DVR OFF', () => psOk(`
+reg add "HKCU\\SOFTWARE\\Microsoft\\GameBar" /v AutoGameModeEnabled /t REG_DWORD /d 1 /f | Out-Null
+reg add "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR" /v AppCaptureEnabled /t REG_DWORD /d 0 /f | Out-Null
+reg add "HKCU\\System\\GameConfigStore" /v GameDVR_Enabled /t REG_DWORD /d 0 /f | Out-Null`));
+    await run('Detener SysMain, WSearch y telemetría', () => psOk(`
+Stop-Service SysMain -Force -ErrorAction SilentlyContinue
+Stop-Service WSearch -Force -ErrorAction SilentlyContinue
+Stop-Service DiagTrack -Force -ErrorAction SilentlyContinue`));
+    await run('Vaciar caché DNS', () => execAsync('ipconfig /flushdns'));
+  } else if (id === 'trabajo') {
+    await run('Plan de energía: Economizador', () => execAsync(`powercfg /setactive ${POWER_GUIDS.trabajo}`));
+    await run('Detener telemetría (DiagTrack)', () => psOk('Stop-Service DiagTrack -Force -ErrorAction SilentlyContinue'));
+    await run('Detener precarga SysMain (menos disco)', () => psOk('Stop-Service SysMain -Force -ErrorAction SilentlyContinue'));
+    await run('CPU a frecuencia reducida', async () => {
+      await execAsync('powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMAX 80');
+      return execAsync('powercfg /setactive scheme_current');
+    });
+  } else if (id === 'balanced') {
+    await run('Plan de energía: Equilibrado', () => execAsync(`powercfg /setactive ${POWER_GUIDS.balanced}`));
+    await run('Restaurar prioridad multimedia y red', () => psOk(`
+Set-ItemProperty -Path '${MMCSS}' -Name SystemResponsiveness -Value 20 -Type DWord -ErrorAction Stop
+Set-ItemProperty -Path '${MMCSS}' -Name NetworkThrottlingIndex -Value 10 -Type DWord -ErrorAction Stop`));
+    await run('Prioridades de juegos por defecto', () => psOk(`
+if (Test-Path '${MMCSS_GAMES}') {
+  Set-ItemProperty -Path '${MMCSS_GAMES}' -Name 'Priority' -Value 2 -Type DWord -ErrorAction SilentlyContinue
+  Set-ItemProperty -Path '${MMCSS_GAMES}' -Name 'Scheduling Category' -Value 'Medium' -ErrorAction SilentlyContinue
+  Set-ItemProperty -Path '${MMCSS_GAMES}' -Name 'SFIO Priority' -Value 'Normal' -ErrorAction SilentlyContinue
+}`));
+    await run('Reactivar SysMain, WSearch y DVR', () => psOk(`
+Start-Service SysMain -ErrorAction SilentlyContinue
+Start-Service WSearch -ErrorAction SilentlyContinue
+Start-Service DiagTrack -ErrorAction SilentlyContinue
+reg add "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR" /v AppCaptureEnabled /t REG_DWORD /d 1 /f | Out-Null
+reg add "HKCU\\System\\GameConfigStore" /v GameDVR_Enabled /t REG_DWORD /d 1 /f | Out-Null`));
+  } else if (id === 'ultimate') {
+    await run('Plan Ultimate Performance', async () => {
+      let guid = POWER_GUIDS.ultimate;
+      const dup = await execOut(`powercfg -duplicatescheme ${POWER_GUIDS.ultimate}`);
+      const m = dup.stdout.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+      if (m) guid = m[1];
+      return execAsync(`powercfg /setactive ${guid}`);
+    });
+    await run('CPU mínima al 100% (sin throttling)', async () => {
+      await execAsync('powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMIN 100');
+      await execAsync('powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMAX 100');
+      return execAsync('powercfg /setactive scheme_current');
+    });
+    await run('Suspensión selectiva USB desactivada', async () => {
+      await execAsync('powercfg /setacvalueindex scheme_current 2a737441-1930-4402-8d77-b2bebba308a3 48e6b7a6-50f5-4782-a5d4-53bb8f07e226 0');
+      return execAsync('powercfg /setactive scheme_current');
+    });
+    await run('Prioridad multimedia máxima', () => psOk(
+      `Set-ItemProperty -Path '${MMCSS}' -Name SystemResponsiveness -Value 10 -Type DWord -ErrorAction Stop`));
+  } else {
+    return { ok: false, steps: [], error: 'Perfil desconocido' };
+  }
+
+  const okCount = steps.filter(s => s.ok).length;
+  addHistory('Perfil', `${id} (${okCount}/${steps.length} pasos)`, { status: okCount === steps.length ? 'OK' : 'WARN' });
+  return { ok: okCount > 0, steps, partial: okCount < steps.length };
+}
+
+ipcMain.handle('apply-profile', async (e, id) => applyProfile(String(id)));
+
+// Legacy entry points (quick actions) — routed through the profile engine.
+ipcMain.handle('set-game-mode', async (e, enable) => applyProfile(enable ? 'gaming' : 'balanced'));
+ipcMain.handle('set-quiet-mode', async (e, enable) => applyProfile(enable ? 'trabajo' : 'balanced'));
+
+/* ═══════════════════════════════════════════════════════════════════
+   NETWORK
+   ═══════════════════════════════════════════════════════════════════ */
+ipcMain.handle('flush-dns', async () => {
+  if (!IS_WIN) return { ok: false };
+  const ok = await execAsync('ipconfig /flushdns');
+  addHistory('Red', 'Caché DNS vaciada');
+  return { ok };
+});
+
+ipcMain.handle('network-reset', async () => {
+  if (!IS_WIN) return { ok: false };
+  const r = await ps(`
+try {
+  ipconfig /flushdns | Out-Null
+  netsh winsock reset | Out-Null
+  netsh int ip reset | Out-Null
+  Write-Output 'OK'
+} catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout: 20000 });
+  const ok = /^OK/.test(r.stdout);
+  if (ok) addHistory('Red', 'Pila de red reiniciada (requiere reinicio)');
+  return { ok, reboot: ok, error: ok ? null : (isAdmin ? 'Falló' : 'Requiere administrador') };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   REGISTRY — real, conservative orphan scan + backup-first clean
+   ═══════════════════════════════════════════════════════════════════ */
+ipcMain.handle('scan-registry', async () => {
+  const script = `
+$findings = New-Object System.Collections.ArrayList
+function ToReg($psPath) { return ($psPath -replace '^Microsoft\\.PowerShell\\.Core\\\\Registry::','' -replace '^HKEY_LOCAL_MACHINE','HKLM' -replace '^HKEY_CURRENT_USER','HKCU') }
+
+# 1) Orphaned uninstall entries (InstallLocation that no longer exists)
+$uninst = @(
+  'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+)
+foreach ($u in $uninst) {
+  if (-not (Test-Path $u)) { continue }
+  Get-ChildItem $u -ErrorAction SilentlyContinue | ForEach-Object {
+    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+    if ($p.DisplayName -and $p.InstallLocation) {
+      $loc = $p.InstallLocation.Trim()
+      if ($loc.Length -gt 3 -and -not (Test-Path -LiteralPath $loc -ErrorAction SilentlyContinue)) {
+        [void]$findings.Add([pscustomobject]@{ key=(ToReg $_.PSPath); name=$p.DisplayName; type='Desinstalación huérfana'; severity='BAJA'; detail=$loc })
+      }
+    }
+  }
+}
+
+# 2) App Paths pointing to a missing executable
+$ap = 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths'
+if (Test-Path $ap) {
+  Get-ChildItem $ap -ErrorAction SilentlyContinue | ForEach-Object {
+    $def = (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).'(default)'
+    if ($def) {
+      $exe = $def.Trim('"')
+      if ($exe -and -not (Test-Path -LiteralPath $exe -ErrorAction SilentlyContinue)) {
+        [void]$findings.Add([pscustomobject]@{ key=(ToReg $_.PSPath); name=$_.PSChildName; type='App Path inválido'; severity='MEDIA'; detail=$exe })
+      }
+    }
+  }
+}
+
+# 3) Run entries whose target file is gone
+$runKeys = @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run')
+foreach ($rk in $runKeys) {
+  if (-not (Test-Path $rk)) { continue }
+  $props = Get-ItemProperty -Path $rk -ErrorAction SilentlyContinue
+  foreach ($pr in $props.PSObject.Properties) {
+    if ($pr.Name -like 'PS*') { continue }
+    $cmd = [string]$pr.Value
+    $m = [regex]::Match($cmd, '"([^"]+\\.exe)"')
+    if (-not $m.Success) { $m = [regex]::Match($cmd, '^([^\\s]+\\.exe)') }
+    if ($m.Success) {
+      $exe = $m.Groups[1].Value
+      if (-not (Test-Path -LiteralPath $exe -ErrorAction SilentlyContinue)) {
+        [void]$findings.Add([pscustomobject]@{ key=(ToReg $rk); name=$pr.Name; type='Arranque roto'; severity='MEDIA'; detail=$exe; valueName=$pr.Name })
+      }
+    }
+  }
+}
+$findings | ConvertTo-Json -Compress`;
+  return asArray(await psJson(script, { timeout: 30000 }));
+});
+
+ipcMain.handle('clean-registry', async (e, items) => {
+  if (!IS_WIN) return { ok: false };
+  if (!items || !items.length) return { ok: false, error: 'Nada seleccionado' };
+  try { fs.mkdirSync(BACKUP_DIR, { recursive: true }); } catch (e2) {}
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupSub = path.join(BACKUP_DIR, `reg-${stamp}`);
+  try { fs.mkdirSync(backupSub, { recursive: true }); } catch (e2) {}
+
+  // Build PowerShell: export a .reg backup of each affected key, then delete value (Run) or key (uninstall/app paths).
+  const psItems = items.map((it, i) => {
+    const key = (it.key || '').replace(/'/g, "''");
+    const valueName = it.valueName ? `'${(it.valueName).replace(/'/g, "''")}'` : '$null';
+    const file = path.join(backupSub, `item-${i}.reg`).replace(/\\/g, '\\\\').replace(/'/g, "''");
+    return `@{ key='${key}'; value=${valueName}; file='${file}' }`;
+  }).join(',');
+
+  const script = `
+$items = @(${psItems})
+$done = 0; $errs = @()
+foreach ($it in $items) {
+  $regPath = $it.key
+  try { reg export "$regPath" "$($it.file)" /y 2>$null | Out-Null } catch {}
+  try {
+    $psp = $regPath -replace '^HKLM','HKLM:' -replace '^HKCU','HKCU:'
+    if ($it.value) {
+      Remove-ItemProperty -Path $psp -Name $it.value -Force -ErrorAction Stop
+    } else {
+      Remove-Item -Path $psp -Recurse -Force -ErrorAction Stop
+    }
+    $done++
+  } catch { $errs += $_.Exception.Message }
+}
+[pscustomobject]@{ done=$done; total=$items.Count; errors=$errs } | ConvertTo-Json -Compress`;
+  const res = await psJson(script, { timeout: 30000 });
+  const done = (res && res.done) || 0;
+  addHistory('Registro', `${done} entradas eliminadas (backup en ${path.basename(backupSub)})`, { status: done > 0 ? 'OK' : 'WARN' });
+  return { ok: done > 0, done, total: items.length, backup: backupSub, error: done === 0 ? (isAdmin ? 'No se pudo eliminar' : 'Requiere administrador') : null };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   SYSTEM RESTORE POINT + DEEP REPAIR (SFC / DISM) with streamed log
+   ═══════════════════════════════════════════════════════════════════ */
+ipcMain.handle('create-restore-point', async () => {
+  if (!IS_WIN) return { ok: false };
+  const r = await ps(`
+try {
+  Enable-ComputerRestore -Drive "$env:SystemDrive\\" -ErrorAction SilentlyContinue
+  $rp = 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SystemRestore'
+  if (-not (Test-Path $rp)) { New-Item -Path $rp -Force | Out-Null }
+  Set-ItemProperty -Path $rp -Name 'SystemRestorePointCreationFrequency' -Value 0 -Type DWord -ErrorAction SilentlyContinue
+  Checkpoint-Computer -Description 'Vokoptimizer' -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+  Write-Output 'OK'
+} catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout: 90000 });
+  const ok = /^OK/.test(r.stdout);
+  if (ok) addHistory('Punto de restauración', 'creado');
+  return { ok, error: ok ? null : ((r.stdout || '').replace(/^ERR:/, '') || (isAdmin ? 'Protección del sistema desactivada' : 'Requiere administrador')) };
+});
+
+let healthRunning = false;
+ipcMain.handle('run-health', async (e, kind) => {
+  if (!IS_WIN || healthRunning) return { ok: false, error: healthRunning ? 'Ya en ejecución' : 'No disponible' };
+  healthRunning = true;
+  const send = (line) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('health-log', line); };
+  const t0 = Date.now();
+
+  const runOne = (file, args, label) => new Promise(resolve => {
+    send(`\n> ${label}\n`);
+    let child;
+    try { child = spawn(file, args, { windowsHide: true }); }
+    catch (err) { send(`  [ERROR] ${err.message}\n`); resolve(false); return; }
+    const onData = buf => {
+      const txt = buf.toString('utf8').replace(/ /g, '').replace(/\r/g, '');
+      txt.split('\n').forEach(l => { const t = l.trim(); if (t) send('  ' + t + '\n'); });
+    };
+    child.stdout && child.stdout.on('data', onData);
+    child.stderr && child.stderr.on('data', onData);
+    child.on('error', err => { send(`  [ERROR] ${err.message}\n`); resolve(false); });
+    child.on('close', code => { send(`  [exit ${code}]\n`); resolve(code === 0); });
+  });
+
+  (async () => {
+    let ok = true;
+    if (kind === 'dism' || kind === 'all') ok = await runOne('dism.exe', ['/Online', '/Cleanup-Image', '/RestoreHealth'], 'DISM /RestoreHealth') && ok;
+    if (kind === 'sfc' || kind === 'all') ok = await runOne('sfc.exe', ['/scannow'], 'SFC /scannow') && ok;
+    send(`\n> COMPLETADO en ${Math.round((Date.now() - t0) / 1000)}s\n`);
+    addHistory('Reparación del sistema', kind.toUpperCase(), { status: ok ? 'OK' : 'WARN', durationMs: Date.now() - t0 });
+    healthRunning = false;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('health-done', { ok });
+  })();
+
+  return { ok: true, started: true };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   ONE-CLICK OPTIMIZE  (safe bundle)
+   ═══════════════════════════════════════════════════════════════════ */
+ipcMain.handle('optimize-cpu-ram', async () => {
+  if (!IS_WIN) return { ok: false };
+  const before = await memAvailable();
+  await ps(`
+$sig = @"
+using System;
+using System.Runtime.InteropServices;
+public class VokMem2 { [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr hProcess); }
+"@
+try { Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue } catch {}
+Get-Process -ErrorAction SilentlyContinue | ForEach-Object { try { [void][VokMem2]::EmptyWorkingSet($_.Handle) } catch {} }
+[System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
+ipconfig /flushdns | Out-Null`, { timeout: 30000 });
+  await new Promise(r => setTimeout(r, 500));
+  const after = await memAvailable();
+  return { ok: true, freed: Math.max(0, after - before) };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   HISTORY API
+   ═══════════════════════════════════════════════════════════════════ */
+ipcMain.handle('get-history', async () => loadHistory());
+ipcMain.handle('clear-history', async () => { try { fs.writeFileSync(HISTORY_FILE, '[]'); } catch (e) {} return { ok: true }; });
+ipcMain.handle('open-backups', async () => { try { fs.mkdirSync(BACKUP_DIR, { recursive: true }); shell.openPath(BACKUP_DIR); } catch (e) {} return { ok: true }; });
+
+/* ═══════════════════════════════════════════════════════════════════
+   WINDOW CONTROLS
+   ═══════════════════════════════════════════════════════════════════ */
+ipcMain.handle('minimize-window', () => { if (mainWindow) mainWindow.minimize(); });
+ipcMain.handle('maximize-window', () => { if (mainWindow) { mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize(); } });
+ipcMain.handle('close-window', () => { app.isQuiting = true; app.quit(); });
+
+/* ═══════════════════════════════════════════════════════════════════
+   WINDOW + TRAY
+   ═══════════════════════════════════════════════════════════════════ */
+function validBounds(b) {
+  return b && typeof b.width === 'number' && typeof b.height === 'number' &&
+    b.width >= 800 && b.height >= 560 && b.width <= 10000 && b.height <= 10000;
+}
+
+function createWindow() {
+  const s = loadSettings();
+  const saved = validBounds(s.bounds) ? s.bounds : null;
+  mainWindow = new BrowserWindow({
+    width: saved ? saved.width : 1180,
+    height: saved ? saved.height : 760,
+    x: saved && typeof saved.x === 'number' ? saved.x : undefined,
+    y: saved && typeof saved.y === 'number' ? saved.y : undefined,
+    minWidth: 800, minHeight: 560,
+    backgroundColor: '#000000', frame: false, titleBarStyle: 'hidden',
+    icon: ICON_PATH,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false, contextIsolation: true, sandbox: false,
+    },
+    show: false,
+  });
+
+  mainWindow.loadFile(path.join(__dirname, 'src', 'index.html'));
+  mainWindow.once('ready-to-show', () => {
+    mainWindow.show();
+    if (s.maximized) mainWindow.maximize();
+  });
+
+  Menu.setApplicationMenu(null);
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => { shell.openExternal(url); return { action: 'deny' }; });
+
+  const sendMax = () => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('maximize-change', mainWindow.isMaximized()); };
+  mainWindow.on('maximize', sendMax);
+  mainWindow.on('unmaximize', sendMax);
+
+  const persist = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    saveSettings({ bounds: mainWindow.getNormalBounds(), maximized: mainWindow.isMaximized() });
+  };
+  mainWindow.on('resize', persist);
+  mainWindow.on('move', persist);
+  mainWindow.on('close', persist);
+  mainWindow.on('closed', () => { mainWindow = null; });
+}
+
+function showWindow() {
+  if (!mainWindow) { createWindow(); return; }
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function createTray() {
+  try {
+    tray = new Tray(ICON_PATH);
+    tray.setToolTip('Vokoptimizer · System Optimizer');
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: 'Abrir Vokoptimizer', click: () => showWindow() },
+      { type: 'separator' },
+      { label: 'Salir', click: () => { app.isQuiting = true; app.quit(); } },
+    ]));
+    tray.on('click', () => showWindow());
+  } catch (e) {}
+}
+
+app.on('second-instance', () => showWindow());
+
+app.whenReady().then(async () => {
+  await checkAdmin();
+  // Elevation is normally handled by the exe manifest (requireAdministrator),
+  // so packaged builds arrive here already elevated. This relaunch is only a
+  // safety net for packaged builds that somehow started without admin.
+  if (IS_WIN && app.isPackaged && !isAdmin && !process.argv.includes('--elevated')) {
+    const launched = await elevate();
+    if (launched) { app.quit(); return; }
+    // UAC cancelled → continue unelevated; the in-app banner lets the user retry.
+  }
+  createTray();
+  createWindow();
+});
+
+app.on('window-all-closed', () => app.quit());
+app.on('before-quit', () => { app.isQuiting = true; });
