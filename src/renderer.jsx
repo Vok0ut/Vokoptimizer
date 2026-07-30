@@ -231,6 +231,12 @@ function Dashboard({onOptimize,optimizing,optimized,metrics}){
     {t:'Vaciar RAM',d:`${ram.usedGB} GB en uso`,fn:()=>runAction('RAM',api.freeRam(),{successFreed:true})},
     {t:'Flush DNS',d:'Reinicia caché DNS',fn:()=>runAction('Flush DNS',api.flushDns())},
     {t:'Punto restauración',d:'Crea copia segura',fn:()=>runAction('Punto de restauración',api.createRestorePoint())},
+    {t:'Reiniciar red',d:'Winsock + pila IP',fn:async()=>{
+      const ok=await confirmDialog({title:'Reiniciar la pila de red',lines:['Restablece Winsock y la pila TCP/IP.'],detail:'Hace falta reiniciar el equipo para que surta efecto.',danger:true,confirmLabel:'REINICIAR RED'});
+      if(!ok)return;
+      const r=await runAction('Red',api.networkReset());
+      if(r&&r.ok&&r.reboot)toast('Reinicia el equipo para aplicar el cambio','info');
+    }},
   ];
   return(
     <div style={{height:'100%',overflowY:'auto',padding:'24px 28px'}} className="fade-in">
@@ -531,7 +537,7 @@ function RegistryCleaner(){
   const [healthRunning,setHealthRunning]=useState(false);
   const [scanError,setScanError]=useState(null);
   const logRef=useRef();
-  useEffect(()=>{if(!api)return;const off1=api.onHealthLog(l=>setLog(p=>(p+l).slice(-8000)));const off2=api.onHealthDone(()=>{setHealthRunning(false);toast('Reparación finalizada','ok');});return()=>{off1&&off1();off2&&off2();};},[]);
+  useEffect(()=>{if(!api)return;const off1=api.onHealthLog(l=>setLog(p=>(p+l).slice(-8000)));const off2=api.onHealthDone(r=>{setHealthRunning(false);toast(r&&r.cancelled?'Reparación cancelada':'Reparación finalizada',r&&r.cancelled?'info':'ok');});return()=>{off1&&off1();off2&&off2();};},[]);
   useEffect(()=>{if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight;},[log]);
   const scan=async()=>{
     setScanning(true);setScanned(false);setScanError(null);
@@ -595,6 +601,7 @@ function RegistryCleaner(){
           <button className="btn-ghost" onClick={()=>runHealth('sfc')} disabled={healthRunning} style={{padding:'9px 18px',border:'1.5px solid #4a4a4a',background:'transparent',color:healthRunning?'#6e6e6e':'#b5b5b5',fontSize:10,letterSpacing:2,textTransform:'uppercase',transition:'all .15s'}}>SFC /scannow</button>
           <button className="btn-ghost" onClick={()=>runHealth('dism')} disabled={healthRunning} style={{padding:'9px 18px',border:'1.5px solid #4a4a4a',background:'transparent',color:healthRunning?'#6e6e6e':'#b5b5b5',fontSize:10,letterSpacing:2,textTransform:'uppercase',transition:'all .15s'}}>DISM /RestoreHealth</button>
           <button className="btn-pri" onClick={()=>runHealth('all')} disabled={healthRunning} style={{padding:'9px 18px',border:`1.5px solid ${healthRunning?'#3a3a3a':'#fff'}`,background:'transparent',color:healthRunning?'#6e6e6e':'#fff',fontSize:10,letterSpacing:2,textTransform:'uppercase',transition:'all .15s'}}>{healthRunning?'EJECUTANDO...':'Reparación completa'}</button>
+          {healthRunning&&<button onClick={()=>api&&api.cancelHealth()} style={{padding:'9px 18px',border:'1.5px solid #6a3a3a',background:'transparent',color:'#ff9a9a',fontSize:10,letterSpacing:2,textTransform:'uppercase'}}>CANCELAR</button>}
         </div>
         {(log||healthRunning)&&<div ref={logRef} style={{border:'1.5px solid #262626',background:'#080808',padding:'12px 14px',height:180,overflowY:'auto',fontSize:10,color:'#9c9c9c',whiteSpace:'pre-wrap',lineHeight:1.5}}>
           {log||'Iniciando...'}{healthRunning&&<span className="blink">_</span>}

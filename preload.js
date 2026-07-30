@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // restore + repair
   createRestorePoint: ()     => ipcRenderer.invoke('create-restore-point'),
   runHealth:          (kind) => ipcRenderer.invoke('run-health', kind),
+  cancelHealth:       ()     => ipcRenderer.invoke('cancel-health'),
   onHealthLog:  (cb) => { const h = (_e, l) => cb(l); ipcRenderer.on('health-log', h); return () => ipcRenderer.removeListener('health-log', h); },
   onHealthDone: (cb) => { const h = (_e, r) => cb(r); ipcRenderer.on('health-done', h); return () => ipcRenderer.removeListener('health-done', h); },
 

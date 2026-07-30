@@ -544,8 +544,16 @@ Get-Process -ErrorAction SilentlyContinue | ForEach-Object {
 [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
 Write-Output $n`;
   const r = await ps(script, { timeout: 30000 });
-  await new Promise(res => setTimeout(res, 600));
-  const after = await memAvailable();
+  // Una sola muestra 600ms después es ruidosa: el contador de memoria
+  // disponible de Windows fluctúa por actividad ajena a esta operación. Se
+  // toman varias muestras y se usa la mejor (más disponible), para no
+  // reportar "0 liberados" solo porque otro proceso reservó memoria justo
+  // en el instante del muestreo.
+  let after = before;
+  for (let i = 0; i < 3; i++) {
+    await new Promise(res => setTimeout(res, 500));
+    after = Math.max(after, await memAvailable());
+  }
   const freed = Math.max(0, after - before);
   addHistory('Liberar RAM', `${parseInt(r.stdout) || 0} procesos`, { freed });
   return { ok: true, freed, procs: parseInt(r.stdout) || 0 };
@@ -672,6 +680,15 @@ Stop-Service DiagTrack -Force -ErrorAction SilentlyContinue`));
     });
   } else if (id === 'balanced') {
     await run('Plan de energía: Equilibrado', () => execAsync(`powercfg /setactive ${POWER_GUIDS.balanced}`));
+    // "Equilibrado" es el perfil de vuelta al estado normal: revierte
+    // explícitamente el tope de CPU que deja el perfil "trabajo" en vez de
+    // asumir que el plan Equilibrado nunca se tocó (si Windows lo dejó
+    // marcado por otra vía, aquí queda garantizado sin restricción).
+    await run('CPU sin restricciones', async () => {
+      await execAsync('powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMIN 5');
+      await execAsync('powercfg /setacvalueindex scheme_current sub_processor PROCTHROTTLEMAX 100');
+      return execAsync('powercfg /setactive scheme_current');
+    });
     await run('Restaurar prioridad multimedia y red', () => psOk(`
 Set-ItemProperty -Path '${MMCSS}' -Name SystemResponsiveness -Value 20 -Type DWord -ErrorAction Stop
 Set-ItemProperty -Path '${MMCSS}' -Name NetworkThrottlingIndex -Value 10 -Type DWord -ErrorAction Stop`));
@@ -900,9 +917,12 @@ try {
 });
 
 let healthRunning = false;
+let healthChild = null;
+let healthCancelled = false;
 ipcMain.handle('run-health', async (e, kind) => {
   if (!IS_WIN || healthRunning) return { ok: false, error: healthRunning ? 'Ya en ejecución' : 'No disponible' };
   healthRunning = true;
+  healthCancelled = false;
   const send = (line) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('health-log', line); };
   const t0 = Date.now();
 
@@ -911,6 +931,7 @@ ipcMain.handle('run-health', async (e, kind) => {
     let child;
     try { child = spawn(file, args, { windowsHide: true }); }
     catch (err) { send(`  [ERROR] ${err.message}\n`); resolve(false); return; }
+    healthChild = child;
     const onData = buf => {
       const txt = buf.toString('utf8').replace(/ /g, '').replace(/\r/g, '');
       txt.split('\n').forEach(l => { const t = l.trim(); if (t) send('  ' + t + '\n'); });
@@ -918,20 +939,33 @@ ipcMain.handle('run-health', async (e, kind) => {
     child.stdout && child.stdout.on('data', onData);
     child.stderr && child.stderr.on('data', onData);
     child.on('error', err => { send(`  [ERROR] ${err.message}\n`); resolve(false); });
-    child.on('close', code => { send(`  [exit ${code}]\n`); resolve(code === 0); });
+    child.on('close', code => {
+      healthChild = null;
+      send(healthCancelled ? '  [cancelado]\n' : `  [exit ${code}]\n`);
+      resolve(code === 0);
+    });
   });
 
   (async () => {
     let ok = true;
     if (kind === 'dism' || kind === 'all') ok = await runOne('dism.exe', ['/Online', '/Cleanup-Image', '/RestoreHealth'], 'DISM /RestoreHealth') && ok;
-    if (kind === 'sfc' || kind === 'all') ok = await runOne('sfc.exe', ['/scannow'], 'SFC /scannow') && ok;
-    send(`\n> COMPLETADO en ${Math.round((Date.now() - t0) / 1000)}s\n`);
-    addHistory('Reparación del sistema', kind.toUpperCase(), { status: ok ? 'OK' : 'WARN', durationMs: Date.now() - t0 });
+    if (!healthCancelled && (kind === 'sfc' || kind === 'all')) ok = await runOne('sfc.exe', ['/scannow'], 'SFC /scannow') && ok;
+    send(healthCancelled ? '\n> CANCELADO por el usuario\n' : `\n> COMPLETADO en ${Math.round((Date.now() - t0) / 1000)}s\n`);
+    addHistory('Reparación del sistema', kind.toUpperCase(), { status: healthCancelled ? 'WARN' : (ok ? 'OK' : 'WARN'), durationMs: Date.now() - t0 });
     healthRunning = false;
-    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('health-done', { ok });
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('health-done', { ok: ok && !healthCancelled, cancelled: healthCancelled });
   })();
 
   return { ok: true, started: true };
+});
+
+ipcMain.handle('cancel-health', async () => {
+  if (!healthRunning || !healthChild) return { ok: false, error: 'No hay ninguna reparación en curso' };
+  healthCancelled = true;
+  // SFC/DISM no responden a una señal normal; taskkill /T corta también los
+  // hijos que lanzan internamente (p.ej. TrustedInstaller para DISM).
+  try { await execAsync('taskkill /PID ' + healthChild.pid + ' /T /F'); } catch (e) {}
+  return { ok: true };
 });
 
 /* ═══════════════════════════════════════════════════════════════════
