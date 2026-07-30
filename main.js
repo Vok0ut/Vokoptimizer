@@ -7,7 +7,14 @@ const si = require('systeminformation');
 
 app.disableHardwareAcceleration();
 const gotTheLock = app.requestSingleInstanceLock();
-if (!gotTheLock) { app.quit(); }
+if (!gotTheLock) {
+  // app.quit() solo programa la salida; no detiene la ejecución síncrona
+  // del resto de este script. Sin el exit, la segunda instancia registraba
+  // igualmente todos los handlers IPC y llegaba a crear una ventana y un
+  // icono de bandeja reales (aunque fuera brevemente) antes de cerrarse.
+  app.quit();
+  process.exit(0);
+}
 let mainWindow = null;
 let tray = null;
 
@@ -35,10 +42,16 @@ function saveSettings(patch) {
 // pasar datos (p.ej. rutas de registro con comillas o caracteres raros) sin
 // interpolarlos como literales dentro del script — el script los lee con
 // `[Console]::In.ReadToEnd()` en vez de que Node los concatene como texto.
+// PowerShell escribe su salida en la codificación de consola del sistema
+// (normalmente un codepage OEM, no UTF-8) salvo que se le indique lo
+// contrario. Node decodifica stdout como UTF-8 por defecto, así que sin
+// esto cualquier acento/ñ en nombres de servicios, rutas o entradas de
+// registro llegaba corrupto al renderer.
+const PS_FORCE_UTF8 = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n";
 function ps(script, { timeout = 20000, input } = {}) {
   return new Promise(resolve => {
     if (!IS_WIN) { resolve({ err: new Error('not windows'), stdout: '', stderr: '' }); return; }
-    const encoded = Buffer.from(script, 'utf16le').toString('base64');
+    const encoded = Buffer.from(PS_FORCE_UTF8 + script, 'utf16le').toString('base64');
     const child = execFile('powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
       { timeout, maxBuffer: 1024 * 1024 * 96, windowsHide: true },
@@ -267,11 +280,16 @@ function P($id) {
     'temp_win'   { return @("$env:SystemRoot\\Temp") }
     'thumbs'     { return @("$env:LOCALAPPDATA\\Microsoft\\Windows\\Explorer\\thumbcache_*.db", "$env:LOCALAPPDATA\\Microsoft\\Windows\\Explorer\\iconcache_*.db") }
     'browser'    { return @(
-        "$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\Cache",
-        "$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\Code Cache",
-        "$env:LOCALAPPDATA\\Microsoft\\Edge\\User Data\\Default\\Cache",
-        "$env:LOCALAPPDATA\\Microsoft\\Edge\\User Data\\Default\\Code Cache",
-        "$env:LOCALAPPDATA\\Mozilla\\Firefox\\Profiles") }
+        # '*' en vez de 'Default': cubre también Profile 1, Profile 2... de
+        # usuarios con varios perfiles de Chrome/Edge, no solo el primero.
+        "$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\*\\Cache",
+        "$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\*\\Code Cache",
+        "$env:LOCALAPPDATA\\Microsoft\\Edge\\User Data\\*\\Cache",
+        "$env:LOCALAPPDATA\\Microsoft\\Edge\\User Data\\*\\Code Cache",
+        # Antes apuntaba a la carpeta Profiles entera: habría borrado
+        # historial, contraseñas y marcadores además de la caché. cache2 es
+        # el subdirectorio real de caché de Firefox dentro de cada perfil.
+        "$env:LOCALAPPDATA\\Mozilla\\Firefox\\Profiles\\*\\cache2") }
     'wer'        { return @("$env:ProgramData\\Microsoft\\Windows\\WER\\ReportQueue", "$env:ProgramData\\Microsoft\\Windows\\WER\\ReportArchive", "$env:LOCALAPPDATA\\Microsoft\\Windows\\WER") }
     'dumps'      { return @("$env:SystemRoot\\Minidump", "$env:LOCALAPPDATA\\CrashDumps") }
     'delivery'   { return @("$env:SystemRoot\\SoftwareDistribution\\DeliveryOptimization") }
@@ -309,7 +327,11 @@ foreach ($id in $ids) {
     foreach ($p in (P $id)) {
       try {
         if ($p -like '*[*]*') {
-          Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | ForEach-Object {
+          # -Recurse: cuando el comodín está en mitad de la ruta (p.ej.
+          # "User Data\*\Cache") esto resuelve el directorio de cada perfil
+          # y hay que bajar dentro de él; para los globs de archivo suelto
+          # (thumbcache_*.db) -Recurse no cambia nada porque no son contenedores.
+          Get-ChildItem -Path $p -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
             if ($cutoff -and $_.LastWriteTime -gt $cutoff) { return }
             $size += [int64]$_.Length; $count++
           }
@@ -357,7 +379,7 @@ foreach ($id in $ids) {
   foreach ($p in (P $id)) {
     try {
       if ($p -like '*[*]*') {
-        Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        Get-ChildItem -Path $p -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
           if ($cutoff -and $_.LastWriteTime -gt $cutoff) { return }
           try { $freed += [int64]$_.Length; Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
         }
@@ -833,8 +855,11 @@ ipcMain.handle('clean-registry', async (e, items) => {
   if (!IS_WIN) return { ok: false };
   if (!items || !items.length) return { ok: false, error: 'Nada seleccionado' };
 
-  // Validar contra la whitelist del último scan-registry.
-  const whitelisted = items.filter(it => lastRegistryScan.has(`${it.key} ${it.valueName || ''}`));
+  // Validador estático independiente de la whitelist: por muy en la
+  // whitelist que esté, esto solo debe tocar HKLM/HKCU (nunca HKCR, HKU,
+  // ni nada colado por error).
+  const validKey = k => /^HK(LM|CU):?\\/i.test(k || '');
+  const whitelisted = items.filter(it => validKey(it.key) && lastRegistryScan.has(`${it.key} ${it.valueName || ''}`));
   const rejected = items.length - whitelisted.length;
   if (!whitelisted.length) {
     return { ok: false, error: 'Ningún elemento coincide con el último escaneo; vuelve a escanear el registro' };
