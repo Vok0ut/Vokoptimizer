@@ -42,10 +42,27 @@ function ps(script, { timeout = 20000 } = {}) {
     );
   });
 }
+// Antes esta función devolvía `null` para timeout, error de ejecución,
+// salida vacía y JSON inválido por igual — la UI no podía distinguir
+// "no hay nada que mostrar" de "algo falló". Ahora siempre resuelve con
+// un sobre {ok, kind, error, data} explícito.
 async function psJson(script, opts) {
   const r = await ps(script, opts);
-  if (!r.stdout) return null;
-  try { return JSON.parse(r.stdout); } catch (e) { return null; }
+  if (r.err) {
+    const timedOut = r.err.killed || r.err.signal === 'SIGTERM' || /ETIMEDOUT/i.test(String(r.err.message || ''));
+    return {
+      ok: false,
+      kind: timedOut ? 'timeout' : 'exec_error',
+      error: r.stderr || r.err.message || 'PowerShell falló',
+      data: null,
+    };
+  }
+  if (!r.stdout) return { ok: true, kind: 'empty', error: null, data: null };
+  try {
+    return { ok: true, kind: 'ok', error: null, data: JSON.parse(r.stdout) };
+  } catch (e) {
+    return { ok: false, kind: 'parse_error', error: 'Respuesta inesperada de PowerShell', data: null };
+  }
 }
 const asArray = v => (v == null ? [] : Array.isArray(v) ? v : [v]);
 
@@ -287,14 +304,18 @@ foreach ($id in $ids) {
   $out += [pscustomobject]@{ id = $id; size = $size; count = $count }
 }
 $out | ConvertTo-Json -Compress`;
-  const data = await psJson(script, { timeout: 60000 });
+  const r = await psJson(script, { timeout: 60000 });
+  if (!r.ok) return { ok: false, error: r.error };
   const byId = {};
-  asArray(data).forEach(d => { byId[d.id] = d; });
-  return JUNK_CATS.map(c => ({
-    ...c,
-    sizeBytes: (byId[c.id] && byId[c.id].size) || 0,
-    count: (byId[c.id] && byId[c.id].count) || 0,
-  }));
+  asArray(r.data).forEach(d => { byId[d.id] = d; });
+  return {
+    ok: true,
+    data: JUNK_CATS.map(c => ({
+      ...c,
+      sizeBytes: (byId[c.id] && byId[c.id].size) || 0,
+      count: (byId[c.id] && byId[c.id].count) || 0,
+    })),
+  };
 });
 
 ipcMain.handle('clean-junk', async (e, selectedIds) => {
@@ -335,6 +356,10 @@ foreach ($id in $ids) {
 }
 Write-Output $freed`;
   const r = await ps(script, { timeout: 120000 });
+  if (r.err) {
+    addHistory('Limpieza de archivos', 'Falló: ' + (r.stderr || r.err.message), { status: 'ERROR', durationMs: Date.now() - t0 });
+    return { ok: false, error: r.stderr || r.err.message || 'PowerShell falló', freed: 0 };
+  }
   const freed = parseInt((r.stdout || '0').trim()) || 0;
   addHistory('Limpieza de archivos', `${ids.length} categorías`, { freed, durationMs: Date.now() - t0 });
   return { ok: true, freed };
@@ -367,22 +392,27 @@ ipcMain.handle('list-services', async () => {
 $names = @(${names.map(n => `'${n}'`).join(',')})
 Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $names -contains $_.Name } |
   Select-Object Name, DisplayName, State, StartMode | ConvertTo-Json -Compress`;
-  const data = asArray(await psJson(script, { timeout: 15000 }));
-  return names.map(n => {
-    const row = data.find(d => d.Name === n) || {};
-    const meta = SVC_META[n];
-    return {
-      name: n,
-      label: meta.label,
-      display: row.DisplayName || meta.label,
-      state: row.State || 'Desconocido',
-      startMode: row.StartMode || '—',
-      impact: meta.impact,
-      safe: meta.safe,
-      desc: meta.desc,
-      present: !!row.Name,
-    };
-  }).filter(s => s.present);
+  const r = await psJson(script, { timeout: 15000 });
+  if (!r.ok) return { ok: false, error: r.error };
+  const data = asArray(r.data);
+  return {
+    ok: true,
+    data: names.map(n => {
+      const row = data.find(d => d.Name === n) || {};
+      const meta = SVC_META[n];
+      return {
+        name: n,
+        label: meta.label,
+        display: row.DisplayName || meta.label,
+        state: row.State || 'Desconocido',
+        startMode: row.StartMode || '—',
+        impact: meta.impact,
+        safe: meta.safe,
+        desc: meta.desc,
+        present: !!row.Name,
+      };
+    }).filter(s => s.present),
+  };
 });
 
 ipcMain.handle('set-service', async (e, name, action) => {
@@ -444,7 +474,8 @@ foreach ($f in $folders) {
   }
 }
 $result | ConvertTo-Json -Compress`;
-  return asArray(await psJson(script, { timeout: 15000 }));
+  const r = await psJson(script, { timeout: 15000 });
+  return r.ok ? { ok: true, data: asArray(r.data) } : { ok: false, error: r.error };
 });
 
 ipcMain.handle('toggle-startup', async (e, item, enable) => {
@@ -740,12 +771,14 @@ foreach ($rk in $runKeys) {
   }
 }
 $findings | ConvertTo-Json -Compress`;
-  const findings = asArray(await psJson(script, { timeout: 30000 }));
+  const r = await psJson(script, { timeout: 30000 });
+  if (!r.ok) return { ok: false, error: r.error };
+  const findings = asArray(r.data);
   // Whitelist: clean-registry solo puede tocar exactamente lo que este scan
   // encontró. Evita que un estado de renderer corrupto o desincronizado borre
   // claves arbitrarias del registro.
   lastRegistryScan = new Map(findings.map(f => [`${f.key} ${f.valueName || ''}`, f]));
-  return findings;
+  return { ok: true, data: findings };
 });
 
 ipcMain.handle('clean-registry', async (e, items) => {
@@ -795,10 +828,15 @@ foreach ($it in $items) {
   } catch { $errs += $_.Exception.Message }
 }
 [pscustomobject]@{ done=$done; total=$items.Count; errors=$errs } | ConvertTo-Json -Compress`;
-  const res = await psJson(script, { timeout: 30000 });
-  const done = (res && res.done) || 0;
-  // Las claves procesadas ya no son válidas para un segundo intento sin re-escanear.
+  const r = await psJson(script, { timeout: 30000 });
+  // Las claves procesadas ya no son válidas para un segundo intento sin re-escanear,
+  // tanto si PowerShell falló como si tuvo éxito parcial.
   whitelisted.forEach(it => lastRegistryScan.delete(`${it.key} ${it.valueName || ''}`));
+  if (!r.ok) {
+    addHistory('Registro', 'Falló la limpieza: ' + r.error, { status: 'ERROR' });
+    return { ok: false, error: r.error, done: 0, total: items.length, backup: backupSub };
+  }
+  const done = (r.data && r.data.done) || 0;
   addHistory('Registro', `${done} entradas eliminadas (backup en ${path.basename(backupSub)})`, { status: done > 0 ? 'OK' : 'WARN' });
   return {
     ok: done > 0,

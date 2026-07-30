@@ -1,6 +1,7 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { ConfirmRoot, confirmDialog } from './ui/confirm.jsx';
+import { useAsync } from './lib/use-async.js';
 const {useState,useEffect,useRef,useCallback}=React;
 const api=window.electronAPI||null;
 
@@ -30,14 +31,6 @@ async function runAction(label,promise,{successFreed}={}){
     if(successFreed&&r&&r.freed!=null){toast(`${label}: ${fmtBytes(r.freed)} liberados`,'ok');return r;}
     toast(`${label} ✓`,'ok');return r;
   }catch(e){toast(`${label}: error`,'err');return{ok:false};}
-}
-
-/* ── Async hook ────────────────────── */
-function useAsync(fn){
-  const [st,setSt]=useState({loading:true,data:null});
-  const run=useCallback(()=>{setSt(s=>({...s,loading:true}));Promise.resolve(fn()).then(d=>setSt({loading:false,data:d})).catch(()=>setSt({loading:false,data:null}));},[]);
-  useEffect(()=>{run();},[run]);
-  return[st,run,setSt];
 }
 
 /* ── Window size hook ──────────────── */
@@ -88,6 +81,12 @@ const SLabel=({children})=>(<div style={{fontSize:11,color:'#a8a8a8',letterSpaci
 // Two-tone ASCII progress bar: bright filled blocks over dim empty track
 const BarGlyph=({pct,w=24})=>{const f=Math.max(0,Math.min(w,Math.round((pct/100)*w)));return(<span style={{letterSpacing:-1}}><span style={{color:'#ededed'}}>{'█'.repeat(f)}</span><span style={{color:'#333'}}>{'░'.repeat(w-f)}</span></span>);};
 const Loading=({label='Cargando'})=>(<div style={{display:'flex',alignItems:'center',gap:10,color:'#8a8a8a',fontSize:11,padding:'20px 0'}}><span className="spinner"/> {label}<span className="blink">_</span></div>);
+// Estado de fallo explícito — distinto de "cargando" y de "sin resultados",
+// para no hacer pasar un error de PowerShell por una lista vacía.
+const ErrorState=({message,onRetry})=>(<div style={{display:'flex',flexDirection:'column',gap:10,alignItems:'flex-start',border:'1.5px solid #4a2a2a',background:'#150808',padding:'16px 18px',fontSize:11,color:'#ff9a9a'}}>
+  <span>✗ {message||'Ocurrió un error'}</span>
+  {onRetry&&<button onClick={onRetry} className="btn-ghost" style={{padding:'6px 14px',border:'1.5px solid #6a3a3a',background:'transparent',color:'#ff9a9a',fontSize:10,letterSpacing:1,textTransform:'uppercase'}}>REINTENTAR</button>}
+</div>);
 
 function BarRow({label,value,max=100,width=24}){
   const av=useAnimatedNumber(value,700);
@@ -293,11 +292,17 @@ function FileCleaner(){
   const [cleaning,setCleaning]=useState(false);
   const [vapor,setVapor]=useState(null);
   const [lastAct,setLastAct]=useState('—');
+  const [scanError,setScanError]=useState(null);
   const refs=useRef({});
   const scan=useCallback(async()=>{
-    setScanning(true);
+    setScanning(true);setScanError(null);
     if(!api){setGroups([]);setScanning(false);return;}
-    try{const g=await api.scanJunk();setGroups(g);setSel(new Set(g.map((x,i)=>x.sizeBytes>0&&x.risk==='SEGURO'?i:-1).filter(i=>i>=0)));setLastAct('Escaneado '+fmtNow());}catch(e){toast('Error al escanear','err');}
+    try{
+      const r=await api.scanJunk();
+      if(r&&r.ok===false){setScanError(r.error||'No se pudo escanear el disco');setGroups([]);setScanning(false);return;}
+      const g=(r&&r.data)||[];
+      setGroups(g);setSel(new Set(g.map((x,i)=>x.sizeBytes>0&&x.risk==='SEGURO'?i:-1).filter(i=>i>=0)));setLastAct('Escaneado '+fmtNow());
+    }catch(e){setScanError('Error al escanear');}
     setScanning(false);
   },[]);
   useEffect(()=>{scan();},[scan]);
@@ -335,7 +340,8 @@ function FileCleaner(){
         <div style={{fontSize:11,color:'#a8a8a8',letterSpacing:1,marginBottom:10}}>ESCANEANDO DISCO — midiendo tamaños reales<span className="blink">_</span></div>
         <div className="scanbar"/>
       </div>}
-      <div style={{border:'1.5px solid #303030'}}>
+      {!scanning&&scanError&&<div style={{marginBottom:16}}><ErrorState message={scanError} onRetry={scan}/></div>}
+      {!scanError&&<div style={{border:'1.5px solid #303030'}}>
         <div style={{display:'grid',gridTemplateColumns:'24px 1fr 90px 90px 90px',padding:'8px 16px',borderBottom:'1.5px solid #303030',fontSize:10,fontWeight:600,color:'#b5b5b5',letterSpacing:2,textTransform:'uppercase'}}>
           <span></span><span>CATEGORIA</span><span>TAMANO</span><span>ITEMS</span><span>RIESGO</span>
         </div>
@@ -351,7 +357,7 @@ function FileCleaner(){
           </div>
         ))}
         {!scanning&&groups.length===0&&<div style={{padding:'24px 16px',textAlign:'center',fontSize:11,color:'#6e6e6e'}}>Sistema limpio — nada que eliminar</div>}
-      </div>
+      </div>}
       <div style={{marginTop:18,display:'flex',gap:12}}>
         <button className="btn-ghost" onClick={scan} disabled={scanning} style={{padding:'10px 22px',border:'1.5px solid #5a5a5a',background:'transparent',color:scanning?'#6e6e6e':'#9c9c9c',fontSize:11,letterSpacing:2,textTransform:'uppercase',transition:'all .15s'}}>RE-ESCANEAR</button>
         <button className="btn-pri" onClick={clean} disabled={sel.size===0||!!vapor||cleaning} style={{padding:'10px 22px',border:`1px solid ${sel.size>0&&!cleaning?'#fff':'#3a3a3a'}`,background:'transparent',color:sel.size>0&&!cleaning?'#fff':'#6e6e6e',fontSize:11,letterSpacing:2,textTransform:'uppercase',cursor:sel.size>0?'pointer':'default',transition:'all .15s'}}>{cleaning?'LIMPIANDO...':`LIMPIAR (${fmtBytes(totalBytes)})`}</button>
@@ -382,7 +388,8 @@ function Services(){
     <div style={{height:'100%',overflowY:'auto',padding:'24px 28px'}} className="fade-in">
       <StatGrid cols={4} items={[['SERVICIOS',svcs.length],['EN EJECUCION',running],['DETENIDOS',svcs.length-running],['IMPACTO ALTO',svcs.filter(s=>s.impact==='ALTO').length]]}/>
       {st.loading&&<Loading label="Consultando servicios del sistema"/>}
-      {!st.loading&&<div style={{border:'1.5px solid #262626'}}>
+      {!st.loading&&st.error&&<ErrorState message={st.error} onRetry={reload}/>}
+      {!st.loading&&!st.error&&<div style={{border:'1.5px solid #262626'}}>
         <div style={{display:'grid',gridTemplateColumns:'1fr 110px 90px 110px 80px 96px',padding:'8px 16px',borderBottom:'1.5px solid #262626',fontSize:10,fontWeight:600,color:'#b5b5b5',letterSpacing:2,textTransform:'uppercase'}}>
           <span>SERVICIO</span><span>ESTADO</span><span>IMPACTO</span><span>INICIO</span><span></span><span>ACCION</span>
         </div>
@@ -419,7 +426,8 @@ function StartupManager(){
     <div style={{height:'100%',overflowY:'auto',padding:'24px 28px'}} className="fade-in">
       <StatGrid cols={3} items={[['PROGRAMAS DE ARRANQUE',items.length],['ACTIVOS',enabled],['DESACTIVADOS',items.length-enabled]]}/>
       {st.loading&&<Loading label="Leyendo programas de inicio"/>}
-      {!st.loading&&<div style={{border:'1.5px solid #262626'}}>
+      {!st.loading&&st.error&&<ErrorState message={st.error} onRetry={reload}/>}
+      {!st.loading&&!st.error&&<div style={{border:'1.5px solid #262626'}}>
         <div style={{display:'grid',gridTemplateColumns:'1fr 2fr 90px 110px',padding:'8px 16px',borderBottom:'1.5px solid #262626',fontSize:10,fontWeight:600,color:'#b5b5b5',letterSpacing:2,textTransform:'uppercase'}}>
           <span>PROGRAMA</span><span>COMANDO</span><span>ORIGEN</span><span>ESTADO</span>
         </div>
@@ -508,14 +516,17 @@ function RegistryCleaner(){
   const [cleaning,setCleaning]=useState(false);
   const [log,setLog]=useState('');
   const [healthRunning,setHealthRunning]=useState(false);
+  const [scanError,setScanError]=useState(null);
   const logRef=useRef();
   useEffect(()=>{if(!api)return;const off1=api.onHealthLog(l=>setLog(p=>(p+l).slice(-8000)));const off2=api.onHealthDone(()=>{setHealthRunning(false);toast('Reparación finalizada','ok');});return()=>{off1&&off1();off2&&off2();};},[]);
   useEffect(()=>{if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight;},[log]);
   const scan=async()=>{
-    setScanning(true);setScanned(false);
-    const f=api?await api.scanRegistry():[];
-    setFindings(f||[]);setSel(new Set((f||[]).map((_,i)=>i)));setScanned(true);setScanning(false);
-    toast(`${(f||[]).length} entradas obsoletas encontradas`,'ok');
+    setScanning(true);setScanned(false);setScanError(null);
+    const r=api?await api.scanRegistry():{ok:true,data:[]};
+    if(r&&r.ok===false){setScanError(r.error||'No se pudo escanear el registro');setFindings([]);setScanning(false);return;}
+    const f=(r&&r.data)||[];
+    setFindings(f);setSel(new Set(f.map((_,i)=>i)));setScanned(true);setScanning(false);
+    toast(`${f.length} entradas obsoletas encontradas`,'ok');
   };
   const toggle=i=>setSel(p=>{const n=new Set(p);n.has(i)?n.delete(i):n.add(i);return n;});
   const clean=async()=>{
@@ -542,7 +553,8 @@ function RegistryCleaner(){
         <div style={{fontSize:11,color:'#a8a8a8',letterSpacing:1,marginBottom:10}}>ANALIZANDO REGISTRO — buscando entradas huérfanas reales<span className="blink">_</span></div>
         <div className="scanbar"/>
       </div>}
-      <div style={{border:'1.5px solid #262626'}}>
+      {!scanning&&scanError&&<div style={{marginBottom:16}}><ErrorState message={scanError} onRetry={scan}/></div>}
+      {!scanError&&<div style={{border:'1.5px solid #262626'}}>
         <div style={{display:'grid',gridTemplateColumns:'24px 1fr 150px 80px',padding:'8px 16px',borderBottom:'1.5px solid #262626',fontSize:10,fontWeight:600,color:'#b5b5b5',letterSpacing:2,textTransform:'uppercase'}}><span></span><span>ENTRADA</span><span>TIPO</span><span>GRAVEDAD</span></div>
         {findings.map((r,i)=>(
           <div key={i} onClick={()=>toggle(i)} className="row-in" style={{'--i':i,display:'grid',gridTemplateColumns:'24px 1fr 150px 80px',padding:'10px 16px',borderBottom:'1px solid #1f1f1f',cursor:'pointer',alignItems:'center',transition:'background .15s'}}
@@ -555,7 +567,7 @@ function RegistryCleaner(){
         ))}
         {scanned&&findings.length===0&&<div style={{padding:'24px 16px',textAlign:'center',fontSize:11,color:'#6e6e6e'}}>Registro limpio — sin entradas huérfanas</div>}
         {!scanned&&!scanning&&<div style={{padding:'24px 16px',textAlign:'center',fontSize:11,color:'#6e6e6e'}}>Pulsa ESCANEAR para analizar el registro</div>}
-      </div>
+      </div>}
       <div style={{marginTop:18,display:'flex',gap:12,flexWrap:'wrap'}}>
         <button onClick={scan} disabled={scanning} style={{padding:'10px 22px',border:'1.5px solid #4a4a4a',background:'transparent',color:'#9c9c9c',fontSize:11,letterSpacing:2,textTransform:'uppercase'}}
           onMouseEnter={e=>{e.currentTarget.style.color='#fff';e.currentTarget.style.borderColor='#9a9a9a';}} onMouseLeave={e=>{e.currentTarget.style.color='#9c9c9c';e.currentTarget.style.borderColor='#4a4a4a';}}>ESCANEAR REGISTRO</button>
