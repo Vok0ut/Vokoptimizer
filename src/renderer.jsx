@@ -1,5 +1,6 @@
 import React from 'react';
 import { createRoot } from 'react-dom/client';
+import { ConfirmRoot, confirmDialog } from './ui/confirm.jsx';
 const {useState,useEffect,useRef,useCallback}=React;
 const api=window.electronAPI||null;
 
@@ -305,6 +306,17 @@ function FileCleaner(){
   const totalItems=groups.reduce((s,g)=>s+(g.count||0),0);
   const clean=async()=>{
     if(cleaning||!sel.size)return;
+    const irreversible=[...sel].map(i=>groups[i]).filter(g=>g&&g.irreversible);
+    if(irreversible.length){
+      const ok=await confirmDialog({
+        title:'Acción irreversible',
+        lines:irreversible.map(g=>`${g.label} — ${fmtBytes(g.sizeBytes||0)}, ${g.count||0} elementos`),
+        detail:'Esto no se puede deshacer. Los archivos no pasarán por ninguna papelera.',
+        danger:true,
+        confirmLabel:'ELIMINAR DEFINITIVAMENTE',
+      });
+      if(!ok)return;
+    }
     setCleaning(true);
     const rects=[];sel.forEach(i=>{const el=refs.current[i];if(el)rects.push(el.getBoundingClientRect());});
     const ids=[...sel].map(i=>groups[i]?.id).filter(Boolean);
@@ -335,7 +347,7 @@ function FileCleaner(){
             <span style={{fontSize:12,color:sel.has(i)?'#fff':'#a8a8a8'}}>{g.label}</span>
             <span style={{fontSize:12,color:'#a8a8a8'}}>{fmtBytes(g.sizeBytes)}</span>
             <span style={{fontSize:12,color:'#9c9c9c'}}>{(g.count||0).toLocaleString()}</span>
-            <span style={{fontSize:10,letterSpacing:1,color:g.risk==='SEGURO'?'#929292':'#b5b5b5',fontWeight:500}}>{g.risk}</span>
+            <span style={{fontSize:10,letterSpacing:1,color:g.risk==='SEGURO'?'#929292':g.risk==='IRREVERSIBLE'?'#ff8888':'#b5b5b5',fontWeight:g.risk==='IRREVERSIBLE'?700:500}}>{g.risk}</span>
           </div>
         ))}
         {!scanning&&groups.length===0&&<div style={{padding:'24px 16px',textAlign:'center',fontSize:11,color:'#6e6e6e'}}>Sistema limpio — nada que eliminar</div>}
@@ -354,7 +366,15 @@ function Services(){
   const [busy,setBusy]=useState(null);
   const svcs=st.data||[];
   const act=async(s,action)=>{
-    if(!s.safe&&(action==='stop'||action==='disable')){if(!window.confirm(`"${s.label}" puede ser importante para el sistema.\n¿Seguro que quieres ${action==='stop'?'detenerlo':'desactivarlo'}?`))return;}
+    if(!s.safe&&(action==='stop'||action==='disable')){
+      const ok=await confirmDialog({
+        title:action==='stop'?'Detener servicio':'Desactivar servicio',
+        lines:[`"${s.label}" puede ser importante para el sistema.`],
+        detail:`¿Seguro que quieres ${action==='stop'?'detenerlo':'desactivarlo'}?`,
+        danger:true,
+      });
+      if(!ok)return;
+    }
     setBusy(s.name);await runAction(s.label,api.setService(s.name,action));await reload();setBusy(null);
   };
   const running=svcs.filter(s=>s.state==='Running').length;
@@ -437,7 +457,12 @@ function CpuOptimizer({metrics}){
     setResult(r);setPhase('done');
     if(r&&r.ok!==false)toast(`RAM liberada: ${fmtBytes(r.freed||0)}`,'ok');
   };
-  const kill=async(p)=>{if(!p.pid)return;if(!window.confirm(`¿Finalizar el proceso "${p.Name}" (PID ${p.pid})?`))return;await runAction('Finalizar '+p.Name,api.killProcess(p.pid));};
+  const kill=async(p)=>{
+    if(!p.pid)return;
+    const ok=await confirmDialog({title:'Finalizar proceso',lines:[`"${p.Name}" (PID ${p.pid})`],danger:true,confirmLabel:'FINALIZAR'});
+    if(!ok)return;
+    await runAction('Finalizar '+p.Name,api.killProcess(p.pid));
+  };
   return(
     <div style={{height:'100%',overflowY:'auto',padding:'24px 28px'}} className="fade-in">
       <div style={{display:'grid',gridTemplateColumns:narrow?'1fr':'1fr 1fr',gap:28}}>
@@ -495,7 +520,13 @@ function RegistryCleaner(){
   const toggle=i=>setSel(p=>{const n=new Set(p);n.has(i)?n.delete(i):n.add(i);return n;});
   const clean=async()=>{
     if(!sel.size)return;
-    if(!window.confirm(`Se eliminarán ${sel.size} entradas del registro.\nSe creará una copia .reg de seguridad antes de borrar.\n¿Continuar?`))return;
+    const ok=await confirmDialog({
+      title:'Eliminar entradas del registro',
+      lines:[`Se eliminarán ${sel.size} entradas del registro.`],
+      detail:'Se creará una copia .reg de seguridad antes de borrar cada una; si el backup falla, esa entrada se omite.',
+      danger:true,
+    });
+    if(!ok)return;
     setCleaning(true);
     const items=[...sel].map(i=>findings[i]).filter(Boolean);
     const r=await api.cleanRegistry(items);
@@ -590,7 +621,11 @@ function History(){
   const [st,reload]=useAsync(()=>api?api.getHistory():[]);
   const rows=st.data||[];
   const totalFreed=rows.reduce((s,r)=>s+(r.freed||0),0);
-  const clearAll=async()=>{if(!window.confirm('¿Borrar todo el historial?'))return;await api.clearHistory();reload();};
+  const clearAll=async()=>{
+    const ok=await confirmDialog({title:'Borrar historial',lines:['Se borrará todo el historial de acciones.'],danger:true});
+    if(!ok)return;
+    await api.clearHistory();reload();
+  };
   return(
     <div style={{height:'100%',overflowY:'auto',padding:'24px 28px'}} className="fade-in">
       <StatGrid cols={3} items={[['OPERACIONES',rows.length],['ESPACIO LIBERADO',fmtBytes(totalFreed)],['ÚLTIMA',rows[0]?fmtDate(rows[0].ts):'—']]}/>
@@ -754,6 +789,7 @@ function App(){
   return(
     <div style={{height:'100vh',display:'flex',flexDirection:'column'}}>
       <Toasts/>
+      <ConfirmRoot/>
       <TitleBar/>
       {intro&&<Intro onDone={()=>setIntro(false)}/>}
       {!intro&&view===null&&<OrbitalMenu onSelect={setView}/>}

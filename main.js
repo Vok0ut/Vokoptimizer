@@ -67,6 +67,10 @@ function addHistory(op, detail, opts = {}) {
    ADMIN detection / elevation
    ═══════════════════════════════════════════════════════════════════ */
 let isAdmin = false;
+
+// Whitelist de la última llamada a scan-registry; ver clean-registry.
+let lastRegistryScan = new Map();
+
 async function checkAdmin() {
   if (!IS_WIN) { isAdmin = false; return false; }
   const r = await ps('([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)', { timeout: 6000 });
@@ -205,9 +209,9 @@ ipcMain.handle('get-system-info', async () => {
    DISK CLEANUP — real scan (sizes/counts) + real clean
    ═══════════════════════════════════════════════════════════════════ */
 const JUNK_CATS = [
-  { id: 'temp_user', label: 'Temporales del usuario', risk: 'SEGURO' },
-  { id: 'temp_win', label: 'Temporales de Windows', risk: 'SEGURO' },
-  { id: 'recycle', label: 'Papelera de reciclaje', risk: 'SEGURO' },
+  { id: 'temp_user', label: 'Temporales del usuario', risk: 'SEGURO', olderThanHours: 24 },
+  { id: 'temp_win', label: 'Temporales de Windows', risk: 'SEGURO', olderThanHours: 24 },
+  { id: 'recycle', label: 'Papelera de reciclaje', risk: 'IRREVERSIBLE', irreversible: true },
   { id: 'thumbs', label: 'Miniaturas (thumbcache)', risk: 'SEGURO' },
   { id: 'browser', label: 'Caché de navegadores', risk: 'SEGURO' },
   { id: 'wer', label: 'Reportes de errores (WER)', risk: 'SEGURO' },
@@ -221,7 +225,7 @@ const JUNK_CATS = [
 const PS_JUNK_PATHS = `
 function P($id) {
   switch ($id) {
-    'temp_user'  { return @($env:TEMP, "$env:LOCALAPPDATA\\Temp") }
+    'temp_user'  { return @($env:TEMP) }
     'temp_win'   { return @("$env:SystemRoot\\Temp") }
     'thumbs'     { return @("$env:LOCALAPPDATA\\Microsoft\\Windows\\Explorer\\thumbcache_*.db", "$env:LOCALAPPDATA\\Microsoft\\Windows\\Explorer\\iconcache_*.db") }
     'browser'    { return @(
@@ -237,7 +241,15 @@ function P($id) {
     'prefetch'   { return @("$env:SystemRoot\\Prefetch") }
   }
   return @()
-}`;
+}
+# Solo aplica a categorías con corte temporal (temp_user/temp_win); evita borrar
+# archivos que otro proceso pueda tener abiertos en este mismo instante, y nunca
+# toca el propio proceso (PID actual) ni su árbol de trabajo.
+function CutoffHours($id) {
+  switch ($id) { 'temp_user' { return 24 } 'temp_win' { return 24 } }
+  return 0
+}
+$ownPid = $PID`;
 
 ipcMain.handle('scan-junk', async () => {
   const ids = JUNK_CATS.map(c => c.id);
@@ -254,12 +266,20 @@ foreach ($id in $ids) {
       if ($rb) { foreach ($it in $rb.Items()) { try { $size += [int64]$it.Size; $count++ } catch {} } }
     } catch {}
   } else {
+    $hrs = CutoffHours $id
+    $cutoff = if ($hrs -gt 0) { (Get-Date).AddHours(-$hrs) } else { $null }
     foreach ($p in (P $id)) {
       try {
         if ($p -like '*[*]*') {
-          Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | ForEach-Object { $size += [int64]$_.Length; $count++ }
+          Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($cutoff -and $_.LastWriteTime -gt $cutoff) { return }
+            $size += [int64]$_.Length; $count++
+          }
         } elseif (Test-Path -LiteralPath $p) {
-          Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object { $size += [int64]$_.Length; $count++ }
+          Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($cutoff -and $_.LastWriteTime -gt $cutoff) { return }
+            $size += [int64]$_.Length; $count++
+          }
         }
       } catch {}
     }
@@ -290,18 +310,24 @@ foreach ($id in $ids) {
     try { Clear-RecycleBin -Force -ErrorAction SilentlyContinue } catch {}
     continue
   }
+  $hrs = CutoffHours $id
+  $cutoff = if ($hrs -gt 0) { (Get-Date).AddHours(-$hrs) } else { $null }
   foreach ($p in (P $id)) {
     try {
       if ($p -like '*[*]*') {
         Get-ChildItem -Path $p -Force -ErrorAction SilentlyContinue | ForEach-Object {
+          if ($cutoff -and $_.LastWriteTime -gt $cutoff) { return }
           try { $freed += [int64]$_.Length; Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
         }
       } elseif (Test-Path -LiteralPath $p) {
         Get-ChildItem -LiteralPath $p -Recurse -Force -File -ErrorAction SilentlyContinue | ForEach-Object {
+          if ($cutoff -and $_.LastWriteTime -gt $cutoff) { return }
           try { $freed += [int64]$_.Length; Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue } catch {}
         }
-        Get-ChildItem -LiteralPath $p -Recurse -Force -Directory -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object {
-          try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+        if (-not $cutoff) {
+          Get-ChildItem -LiteralPath $p -Recurse -Force -Directory -ErrorAction SilentlyContinue | Sort-Object { $_.FullName.Length } -Descending | ForEach-Object {
+            try { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
         }
       }
     } catch {}
@@ -473,10 +499,34 @@ Write-Output $n`;
   return { ok: true, freed, procs: parseInt(r.stdout) || 0 };
 });
 
+// Procesos cuya terminación puede colgar o cerrar la sesión de Windows.
+// Comparación por nombre de imagen (minúsculas, sin .exe).
+const PROTECTED_PROCESSES = new Set([
+  'system', 'system idle process', 'registry', 'smss', 'csrss', 'wininit',
+  'winlogon', 'services', 'lsass', 'lsaiso', 'svchost', 'explorer', 'dwm',
+  'fontdrvhost', 'sihost', 'ctfmon', 'taskhostw', 'runtimebroker',
+  'searchindexer', 'searchhost', 'startmenuexperiencehost', 'shellexperiencehost',
+  'audiodg', 'spoolsv', 'wudfhost', 'memcompression',
+]);
+
 ipcMain.handle('kill-process', async (e, pid) => {
   if (!IS_WIN || !pid) return { ok: false };
-  const r = await ps(`try { Stop-Process -Id ${parseInt(pid)} -Force -ErrorAction Stop; Write-Output 'OK' } catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout: 8000 });
-  return /^OK/.test(r.stdout) ? { ok: true } : { ok: false, error: (r.stdout || '').replace(/^ERR:/, '') };
+  const pidNum = parseInt(pid);
+  if (!Number.isFinite(pidNum) || pidNum <= 0) return { ok: false, error: 'PID inválido' };
+  if (pidNum === process.pid) return { ok: false, error: 'No se puede terminar el propio Vokoptimizer' };
+  const r = await ps(`
+try {
+  $p = Get-Process -Id ${pidNum} -ErrorAction Stop
+  Write-Output ('NAME:' + $p.ProcessName)
+} catch { Write-Output 'ERR:no existe ese proceso' }`, { timeout: 8000 });
+  const out = (r.stdout || '').trim();
+  if (!out.startsWith('NAME:')) return { ok: false, error: out.replace(/^ERR:/, '') || 'proceso no encontrado' };
+  const name = out.slice(5).trim().toLowerCase();
+  if (PROTECTED_PROCESSES.has(name) || pidNum <= 4) {
+    return { ok: false, error: `"${name}" es un proceso protegido del sistema` };
+  }
+  const kr = await ps(`try { Stop-Process -Id ${pidNum} -Force -ErrorAction Stop; Write-Output 'OK' } catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout: 8000 });
+  return /^OK/.test(kr.stdout) ? { ok: true } : { ok: false, error: (kr.stdout || '').replace(/^ERR:/, '') };
 });
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -690,19 +740,33 @@ foreach ($rk in $runKeys) {
   }
 }
 $findings | ConvertTo-Json -Compress`;
-  return asArray(await psJson(script, { timeout: 30000 }));
+  const findings = asArray(await psJson(script, { timeout: 30000 }));
+  // Whitelist: clean-registry solo puede tocar exactamente lo que este scan
+  // encontró. Evita que un estado de renderer corrupto o desincronizado borre
+  // claves arbitrarias del registro.
+  lastRegistryScan = new Map(findings.map(f => [`${f.key} ${f.valueName || ''}`, f]));
+  return findings;
 });
 
 ipcMain.handle('clean-registry', async (e, items) => {
   if (!IS_WIN) return { ok: false };
   if (!items || !items.length) return { ok: false, error: 'Nada seleccionado' };
+
+  // Validar contra la whitelist del último scan-registry.
+  const whitelisted = items.filter(it => lastRegistryScan.has(`${it.key} ${it.valueName || ''}`));
+  const rejected = items.length - whitelisted.length;
+  if (!whitelisted.length) {
+    return { ok: false, error: 'Ningún elemento coincide con el último escaneo; vuelve a escanear el registro' };
+  }
+
   try { fs.mkdirSync(BACKUP_DIR, { recursive: true }); } catch (e2) {}
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const backupSub = path.join(BACKUP_DIR, `reg-${stamp}`);
   try { fs.mkdirSync(backupSub, { recursive: true }); } catch (e2) {}
 
-  // Build PowerShell: export a .reg backup of each affected key, then delete value (Run) or key (uninstall/app paths).
-  const psItems = items.map((it, i) => {
+  // Build PowerShell: export a .reg backup of each affected key, verify it's
+  // non-empty (backup succeeded), and ONLY THEN delete value (Run) or key (uninstall/app paths).
+  const psItems = whitelisted.map((it, i) => {
     const key = (it.key || '').replace(/'/g, "''");
     const valueName = it.valueName ? `'${(it.valueName).replace(/'/g, "''")}'` : '$null';
     const file = path.join(backupSub, `item-${i}.reg`).replace(/\\/g, '\\\\').replace(/'/g, "''");
@@ -714,7 +778,12 @@ $items = @(${psItems})
 $done = 0; $errs = @()
 foreach ($it in $items) {
   $regPath = $it.key
-  try { reg export "$regPath" "$($it.file)" /y 2>$null | Out-Null } catch {}
+  $backupOk = $false
+  try {
+    reg export "$regPath" "$($it.file)" /y *> $null
+    if ((Test-Path -LiteralPath $it.file) -and (Get-Item -LiteralPath $it.file).Length -gt 0) { $backupOk = $true }
+  } catch {}
+  if (-not $backupOk) { $errs += "Backup falló para $regPath, se omite el borrado"; continue }
   try {
     $psp = $regPath -replace '^HKLM','HKLM:' -replace '^HKCU','HKCU:'
     if ($it.value) {
@@ -728,8 +797,16 @@ foreach ($it in $items) {
 [pscustomobject]@{ done=$done; total=$items.Count; errors=$errs } | ConvertTo-Json -Compress`;
   const res = await psJson(script, { timeout: 30000 });
   const done = (res && res.done) || 0;
+  // Las claves procesadas ya no son válidas para un segundo intento sin re-escanear.
+  whitelisted.forEach(it => lastRegistryScan.delete(`${it.key} ${it.valueName || ''}`));
   addHistory('Registro', `${done} entradas eliminadas (backup en ${path.basename(backupSub)})`, { status: done > 0 ? 'OK' : 'WARN' });
-  return { ok: done > 0, done, total: items.length, backup: backupSub, error: done === 0 ? (isAdmin ? 'No se pudo eliminar' : 'Requiere administrador') : null };
+  return {
+    ok: done > 0,
+    done,
+    total: items.length,
+    backup: backupSub,
+    error: done === 0 ? (isAdmin ? 'No se pudo eliminar (backup falló o acceso denegado)' : 'Requiere administrador') : (rejected > 0 ? `${rejected} elementos ignorados (no coinciden con el último escaneo)` : null),
+  };
 });
 
 /* ═══════════════════════════════════════════════════════════════════
