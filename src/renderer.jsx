@@ -64,13 +64,26 @@ function useAnimatedNumber(target,dur=600){
 function useSystemMetrics(ms=2000){
   const [m,setM]=useState({cpu:0,ram:{pct:0,totalGB:0,usedGB:0,freeGB:0},ext:{gpu:0,temp:0,diskPct:0,netMbps:0,procs:0,threads:0,cpuFreq:0,uptime:'—'},topProcs:[]});
   useEffect(()=>{
-    let on=true;
+    let on=true,inFlight=false;
     const poll=async()=>{
       if(!on)return;
+      // Sin este guard, si una lectura tarda más que el intervalo (p.ej. bajo
+      // carga de CPU) el siguiente tick del setInterval lanza otro proceso
+      // powershell.exe encima del anterior, y se van acumulando.
+      if(inFlight)return;
+      // Pausar el polling con la ventana oculta/minimizada a la bandeja: no
+      // hay nadie mirando los números y ahorra un proceso powershell.exe
+      // cada `ms` que no sirve para nada.
+      if(document.hidden)return;
+      inFlight=true;
       if(api&&api.getMetrics){try{const d=await api.getMetrics();if(on&&d)setM(d);}catch(e){}}
       else{setM(p=>({cpu:Math.min(99,Math.max(5,(p.cpu||40)+(Math.random()-.5)*12)),ram:{pct:Math.min(95,Math.max(25,(p.ram?.pct||60)+(Math.random()-.5)*4)),totalGB:16,usedGB:9.6,freeGB:6.4},ext:{gpu:Math.min(95,Math.max(3,(p.ext?.gpu||25)+(Math.random()-.5)*14)),temp:Math.round(55+Math.random()*15),diskPct:42,netMbps:+(Math.random()*30).toFixed(1),procs:Math.round(170+Math.random()*30),threads:Math.round(1100+Math.random()*200),cpuFreq:3.84,uptime:'2d 5h'},topProcs:[{Name:'chrome',CPU:8.2,MemMB:1840,pid:1},{Name:'Code',CPU:5.4,MemMB:920,pid:2},{Name:'explorer',CPU:1.2,MemMB:340,pid:3}]}));}
+      inFlight=false;
     };
-    poll();const id=setInterval(poll,ms);return()=>{on=false;clearInterval(id);};
+    poll();const id=setInterval(poll,ms);
+    const onVis=()=>{if(!document.hidden)poll();};
+    document.addEventListener('visibilitychange',onVis);
+    return()=>{on=false;clearInterval(id);document.removeEventListener('visibilitychange',onVis);};
   },[ms]);
   return m;
 }

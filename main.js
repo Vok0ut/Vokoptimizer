@@ -31,15 +31,20 @@ function saveSettings(patch) {
 /* ═══════════════════════════════════════════════════════════════════
    PowerShell helper — robust, no quoting hell (Base64 EncodedCommand)
    ═══════════════════════════════════════════════════════════════════ */
-function ps(script, { timeout = 20000 } = {}) {
+// `input` (opcional): texto escrito a stdin del proceso y cerrado. Permite
+// pasar datos (p.ej. rutas de registro con comillas o caracteres raros) sin
+// interpolarlos como literales dentro del script — el script los lee con
+// `[Console]::In.ReadToEnd()` en vez de que Node los concatene como texto.
+function ps(script, { timeout = 20000, input } = {}) {
   return new Promise(resolve => {
     if (!IS_WIN) { resolve({ err: new Error('not windows'), stdout: '', stderr: '' }); return; }
     const encoded = Buffer.from(script, 'utf16le').toString('base64');
-    execFile('powershell.exe',
+    const child = execFile('powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
       { timeout, maxBuffer: 1024 * 1024 * 96, windowsHide: true },
       (err, stdout, stderr) => resolve({ err, stdout: (stdout || '').trim(), stderr: (stderr || '').trim() })
     );
+    if (input != null) { child.stdin.write(input, 'utf8'); child.stdin.end(); }
   });
 }
 // Antes esta función devolvía `null` para timeout, error de ejecución,
@@ -136,7 +141,13 @@ async function gpuTempThreads() {
   if (!IS_WIN) return { gpu: -1, temp: -1, threads: 0 };
   const script = `
 $gpu = -1
-try { $s = (Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples; if ($s) { $gpu = [math]::Round((($s | Measure-Object CookedValue -Sum).Sum), 0) } } catch {}
+try {
+  # Filtrar a motores engtype_3D: ~660ms frente a ~2250ms leyendo las ~369
+  # instancias totales, y evita sumar el mismo trabajo contado por varios
+  # tipos de motor (que podía dar un agregado por encima del 100%).
+  $s = (Get-Counter '\GPU Engine(*engtype_3D)\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples
+  if ($s) { $gpu = [math]::Min(100, [math]::Round((($s | Measure-Object CookedValue -Sum).Sum), 0)) }
+} catch {}
 $temp = -1
 try { $t = Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi -ErrorAction SilentlyContinue; if ($t) { $temp = [math]::Round((($t[0].CurrentTemperature) - 2732) / 10, 0) } } catch {}
 $threads = 0
@@ -147,7 +158,17 @@ Write-Output "$gpu|$temp|$threads"`;
   return { gpu: parseInt(p[0]), temp: parseInt(p[1]), threads: parseInt(p[2]) || 0 };
 }
 
+// Evita procesos powershell.exe superpuestos si get-metrics se invoca de
+// nuevo antes de que la lectura anterior termine (defensa adicional al
+// guard del renderer; cubre cualquier otro llamador futuro de este handler).
+let metricsInFlight = null;
 ipcMain.handle('get-metrics', async () => {
+  if (metricsInFlight) return metricsInFlight;
+  metricsInFlight = getMetricsOnce().finally(() => { metricsInFlight = null; });
+  return metricsInFlight;
+});
+
+async function getMetricsOnce() {
   try {
     const [load, mem, fsSize, net, procs, speed, time, gtt] = await Promise.all([
       si.currentLoad().catch(() => ({ currentLoad: 0 })),
@@ -197,7 +218,7 @@ ipcMain.handle('get-metrics', async () => {
   } catch (e) {
     return { cpu: 0, ram: { totalGB: 0, usedGB: 0, freeGB: 0, pct: 0 }, ext: { gpu: -1, temp: -1, diskPct: 0, netMbps: 0, procs: 0, threads: 0, cpuFreq: 0, uptime: '—' }, topProcs: [] };
   }
-});
+}
 
 ipcMain.handle('get-system-info', async () => {
   try {
@@ -578,15 +599,28 @@ function execOut(cmd, timeout = 12000) {
   return new Promise(resolve => exec(cmd, { timeout, windowsHide: true }, (err, stdout) => resolve({ ok: !err, stdout: stdout || '' })));
 }
 
+// `powercfg -duplicatescheme` crea un plan de energía NUEVO cada vez que se
+// llama — sin caché, cada aplicación del perfil "ultimate" iba dejando un
+// "Ultra rendimiento (N)" más en el sistema. Ahora el GUID duplicado se
+// persiste en settings y solo se vuelve a duplicar si ya no existe.
+async function ensureUltimateGuid() {
+  const settings = loadSettings();
+  if (settings.ultimateGuid) {
+    const check = await execOut(`powercfg /query ${settings.ultimateGuid}`);
+    if (check.ok) return settings.ultimateGuid;
+  }
+  const dup = await execOut(`powercfg -duplicatescheme ${POWER_GUIDS.ultimate}`);
+  const m = dup.stdout.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  const guid = m ? m[1] : POWER_GUIDS.ultimate;
+  saveSettings({ ultimateGuid: guid });
+  return guid;
+}
+
 ipcMain.handle('set-power-profile', async (e, profile) => {
   if (!IS_WIN) return { ok: false };
   let guid = POWER_GUIDS[profile] || POWER_GUIDS.balanced;
   // The Ultimate Performance plan often isn't registered; duplicating it registers it (and may assign a new GUID).
-  if (profile === 'ultimate') {
-    const dup = await execOut(`powercfg -duplicatescheme ${POWER_GUIDS.ultimate}`);
-    const m = dup.stdout.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-    if (m) guid = m[1];
-  }
+  if (profile === 'ultimate') guid = await ensureUltimateGuid();
   const ok = await execAsync(`powercfg /setactive ${guid}`);
   addHistory('Plan de energía', profile);
   return { ok };
@@ -655,10 +689,7 @@ reg add "HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\GameDVR" /v AppCapt
 reg add "HKCU\\System\\GameConfigStore" /v GameDVR_Enabled /t REG_DWORD /d 1 /f | Out-Null`));
   } else if (id === 'ultimate') {
     await run('Plan Ultimate Performance', async () => {
-      let guid = POWER_GUIDS.ultimate;
-      const dup = await execOut(`powercfg -duplicatescheme ${POWER_GUIDS.ultimate}`);
-      const m = dup.stdout.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-      if (m) guid = m[1];
+      const guid = await ensureUltimateGuid();
       return execAsync(`powercfg /setactive ${guid}`);
     });
     await run('CPU mínima al 100% (sin throttling)', async () => {
@@ -797,17 +828,19 @@ ipcMain.handle('clean-registry', async (e, items) => {
   const backupSub = path.join(BACKUP_DIR, `reg-${stamp}`);
   try { fs.mkdirSync(backupSub, { recursive: true }); } catch (e2) {}
 
-  // Build PowerShell: export a .reg backup of each affected key, verify it's
-  // non-empty (backup succeeded), and ONLY THEN delete value (Run) or key (uninstall/app paths).
-  const psItems = whitelisted.map((it, i) => {
-    const key = (it.key || '').replace(/'/g, "''");
-    const valueName = it.valueName ? `'${(it.valueName).replace(/'/g, "''")}'` : '$null';
-    const file = path.join(backupSub, `item-${i}.reg`).replace(/\\/g, '\\\\').replace(/'/g, "''");
-    return `@{ key='${key}'; value=${valueName}; file='${file}' }`;
-  }).join(',');
+  // Los datos van por stdin como JSON en vez de interpolarse en el texto del
+  // script: evita depender de un escape manual de comillas para valores que
+  // vienen del registro (nombres de claves, rutas) y podrían romper el
+  // literal de PowerShell si tuvieran algún carácter inesperado.
+  const payload = JSON.stringify(whitelisted.map((it, i) => ({
+    key: it.key || '',
+    value: it.valueName || null,
+    file: path.join(backupSub, `item-${i}.reg`),
+  })));
 
   const script = `
-$items = @(${psItems})
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+$items = @([Console]::In.ReadToEnd() | ConvertFrom-Json)
 $done = 0; $errs = @()
 foreach ($it in $items) {
   $regPath = $it.key
@@ -828,7 +861,7 @@ foreach ($it in $items) {
   } catch { $errs += $_.Exception.Message }
 }
 [pscustomobject]@{ done=$done; total=$items.Count; errors=$errs } | ConvertTo-Json -Compress`;
-  const r = await psJson(script, { timeout: 30000 });
+  const r = await psJson(script, { timeout: 30000, input: payload });
   // Las claves procesadas ya no son válidas para un segundo intento sin re-escanear,
   // tanto si PowerShell falló como si tuvo éxito parcial.
   whitelisted.forEach(it => lastRegistryScan.delete(`${it.key} ${it.valueName || ''}`));
