@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { exec, execFile, spawn } = require('child_process');
+const crypto = require('crypto');
 const si = require('systeminformation');
 
 app.disableHardwareAcceleration();
@@ -48,18 +49,32 @@ function saveSettings(patch) {
 // esto cualquier acento/ñ en nombres de servicios, rutas o entradas de
 // registro llegaba corrupto al renderer.
 const PS_FORCE_UTF8 = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n";
-function ps(script, { timeout = 20000, input } = {}) {
+// Escaneos largos (apps sin usar, restos de configuración, juegos) se
+// registran aquí por nombre mientras están en vuelo, para que cancel-scan
+// pueda matarlos desde la UI. Los handlers de ps()/psJson() sin `name` no
+// se registran (comportamiento idéntico al de siempre).
+const activeScans = new Map();
+function ps(script, { timeout = 20000, input, name } = {}) {
   return new Promise(resolve => {
     if (!IS_WIN) { resolve({ err: new Error('not windows'), stdout: '', stderr: '' }); return; }
     const encoded = Buffer.from(PS_FORCE_UTF8 + script, 'utf16le').toString('base64');
     const child = execFile('powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
       { timeout, maxBuffer: 1024 * 1024 * 96, windowsHide: true },
-      (err, stdout, stderr) => resolve({ err, stdout: (stdout || '').trim(), stderr: (stderr || '').trim() })
+      (err, stdout, stderr) => { if (name) activeScans.delete(name); resolve({ err, stdout: (stdout || '').trim(), stderr: (stderr || '').trim() }); }
     );
+    if (name) activeScans.set(name, child);
     if (input != null) { child.stdin.write(input, 'utf8'); child.stdin.end(); }
   });
 }
+
+ipcMain.handle('cancel-scan', async (e, name) => {
+  const child = activeScans.get(name);
+  if (!child) return { ok: false, error: 'No hay ningún escaneo activo con ese nombre' };
+  try { await execAsync(`taskkill /PID ${child.pid} /T /F`); } catch (e2) {}
+  activeScans.delete(name);
+  return { ok: true };
+});
 // Antes esta función devolvía `null` para timeout, error de ejecución,
 // salida vacía y JSON inválido por igual — la UI no podía distinguir
 // "no hay nada que mostrar" de "algo falló". Ahora siempre resuelve con
@@ -1012,6 +1027,845 @@ ipconfig /flushdns | Out-Null`, { timeout: 30000 });
   await new Promise(r => setTimeout(r, 500));
   const after = await memAvailable();
   return { ok: true, freed: Math.max(0, after - before) };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   APPS SIN USAR — cruza Prefetch (última ejecución real) con el registro
+   de aplicaciones instaladas. Nada se borra aquí: solo se informa y se
+   ofrece abrir la carpeta o lanzar el desinstalador oficial.
+   ═══════════════════════════════════════════════════════════════════ */
+ipcMain.handle('scan-unused-apps', async () => {
+  if (!IS_WIN) return { ok: false, error: 'No disponible' };
+  const script = `
+$prefetch = @{}
+try {
+  Get-ChildItem -Path "$env:SystemRoot\\Prefetch\\*.pf" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    $base = ($_.BaseName -split '-')[0].ToLowerInvariant()
+    if (-not $prefetch.ContainsKey($base) -or $_.LastWriteTime -gt $prefetch[$base]) { $prefetch[$base] = $_.LastWriteTime }
+  }
+} catch {}
+$prefetchCount = $prefetch.Count
+
+$apps = New-Object System.Collections.ArrayList
+$roots = @(
+  'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+)
+foreach ($root in $roots) {
+  if (-not (Test-Path $root)) { continue }
+  Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+    if (-not $p.DisplayName) { return }
+    if ($p.SystemComponent -eq 1) { return }
+    if ($p.ParentKeyName) { return }
+    $loc = [string]$p.InstallLocation
+    $lastUsed = $null; $approx = $true; $matched = $false
+    if ($loc -and (Test-Path -LiteralPath $loc -ErrorAction SilentlyContinue)) {
+      try {
+        $exes = Get-ChildItem -LiteralPath $loc -Recurse -Depth 3 -Filter *.exe -Force -ErrorAction SilentlyContinue
+        foreach ($ex in $exes) {
+          $b = $ex.BaseName.ToLowerInvariant()
+          if ($prefetch.ContainsKey($b)) {
+            $d = $prefetch[$b]
+            if ((-not $lastUsed) -or ($d -gt $lastUsed)) { $lastUsed = $d; $matched = $true }
+          }
+        }
+      } catch {}
+      if (-not $matched) {
+        try { $lastUsed = (Get-Item -LiteralPath $loc -ErrorAction SilentlyContinue).LastWriteTime; $approx = $true } catch {}
+      } else {
+        $approx = $false
+      }
+    }
+    [void]$apps.Add([pscustomobject]@{
+      name = $p.DisplayName
+      publisher = [string]$p.Publisher
+      installLocation = $loc
+      sizeKB = if ($p.EstimatedSize) { [int64]$p.EstimatedSize } else { 0 }
+      lastUsed = if ($lastUsed) { $lastUsed.ToString('o') } else { $null }
+      approximate = $approx
+      uninstallString = [string]$p.UninstallString
+      quietUninstallString = [string]$p.QuietUninstallString
+    })
+  }
+}
+[pscustomobject]@{ apps = $apps; prefetchCount = $prefetchCount } | ConvertTo-Json -Compress -Depth 6`;
+  const r = await psJson(script, { timeout: 45000, name: 'unused-apps' });
+  if (!r.ok) return { ok: false, error: r.kind === 'timeout' ? 'El escaneo tardó demasiado (cancelado)' : r.error };
+  const data = r.data || {};
+  const apps = asArray(data.apps).map(a => ({
+    name: a.name,
+    publisher: a.publisher || '',
+    installLocation: a.installLocation || '',
+    sizeBytes: (a.sizeKB || 0) * 1024,
+    lastUsed: a.lastUsed || null,
+    approximate: !!a.approximate,
+    hasUsageData: !!a.lastUsed,
+    uninstallString: a.uninstallString || '',
+    quietUninstallString: a.quietUninstallString || '',
+  })).sort((x, y) => {
+    // Sin datos al final; entre las que sí tienen fecha, la más antigua primero
+    // (es la que más interesa revisar).
+    if (!x.lastUsed && !y.lastUsed) return 0;
+    if (!x.lastUsed) return 1;
+    if (!y.lastUsed) return -1;
+    return new Date(x.lastUsed) - new Date(y.lastUsed);
+  });
+
+  // Aviso cruzado: si se limpiaron archivos temporales (Prefetch entre ellos)
+  // hace poco, los datos de "último uso" de esta lista pueden estar incompletos.
+  const hist = loadHistory();
+  const recentClean = hist.find(h => h.op === 'Limpieza de archivos' && (Date.now() - h.ts) < 24 * 3600 * 1000);
+  const warning = recentClean
+    ? 'Se limpiaron archivos temporales hace menos de 24h. Si "Prefetch de Windows" estaba entre las categorías, el "último uso" de algunas apps puede estar incompleto o ser una aproximación.'
+    : null;
+
+  return { ok: true, data: { apps, prefetchCount: data.prefetchCount || 0, warning } };
+});
+
+ipcMain.handle('open-app-folder', async (e, folderPath) => {
+  if (!folderPath || typeof folderPath !== 'string') return { ok: false, error: 'Ruta inválida' };
+  try {
+    const err = await shell.openPath(folderPath);
+    return err ? { ok: false, error: err } : { ok: true };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+ipcMain.handle('uninstall-app', async (e, appInfo) => {
+  if (!IS_WIN || !appInfo) return { ok: false };
+  const cmd = appInfo.quietUninstallString || appInfo.uninstallString;
+  if (!cmd) return { ok: false, error: 'Este programa no tiene desinstalador registrado' };
+  // Se lanza el desinstalador oficial tal cual lo registró el instalador —
+  // nunca borramos la carpeta nosotros. No se espera a que termine: muchos
+  // desinstaladores son interactivos (piden confirmación al usuario).
+  try {
+    exec(cmd, { windowsHide: false }, () => {});
+    addHistory('Desinstalación', appInfo.name || cmd);
+    return { ok: true };
+  } catch (err) { return { ok: false, error: err.message }; }
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   RESTOS DE CONFIGURACIÓN — carpetas huérfanas en AppData/ProgramData
+   que ya no pertenecen a ninguna app instalada, proceso en ejecución ni
+   acceso directo del Menú Inicio. Ver diseño acordado (grill-me):
+     - matching por tokens completos normalizados, con fallback de
+       concatenación para nombres de carpeta pegados sin separadores
+       (discordcanary, spotifywebhelper...)
+     - fuentes de referencia: registro Uninstall + procesos en ejecución
+       + accesos directos del Menú Inicio
+     - allowlist fija de herramientas sin entrada de registro
+     - confianza alta = sin ningún match Y 180+ días sin tocarse;
+       baja = pasa el filtro base (90+ días, >100KB, no allowlist) pero
+       no llega a los 180 días. El "sin match" ya es requisito para ser
+       candidato en absoluto — lo único que separa alta/baja a partir de
+       ahí es la antigüedad.
+   ═══════════════════════════════════════════════════════════════════ */
+// Carpetas técnicas de Windows/Electron y herramientas de desarrollo que
+// habitualmente no tienen una entrada de Uninstall 1:1 con su nombre de
+// carpeta, pero que NO son restos de una desinstalación — son estado
+// activo de algo que sigue en uso (gestores de paquetes, runtimes,
+// carpetas propias del sistema operativo).
+const REMNANT_ALLOWLIST = [
+  // Sistema / OS
+  'microsoft', 'packages', 'package cache', 'temp', 'crashdumps', 'd3dscache',
+  'elevateddiagnostics', 'comms', 'connecteddevicesplatform', 'identitycache',
+  'windows', 'systemappdata', 'programdata', 'nvidia corporation', 'nvidia',
+  'intel', 'amd', 'realtek', 'appdata',
+  // Gestores de paquetes / runtimes / herramientas de desarrollo sin registro
+  'npm', 'npm-cache', 'node-gyp', 'pip', 'pypoetry', 'nuget', 'cargo',
+  'go-build', 'nvm', 'pyenv-win', 'yarn', 'composer', 'chocolatey', 'scoop',
+  'ssh', 'gnupg', 'gh', 'git', 'pnpm', 'pnpm-cache', 'deno', 'bun',
+];
+
+ipcMain.handle('scan-config-remnants', async () => {
+  if (!IS_WIN) return { ok: false, error: 'No disponible' };
+  const allowlistPs = REMNANT_ALLOWLIST.map(a => `'${a.replace(/'/g, "''")}'`).join(',');
+  const script = `
+$noise = @('inc','llc','gmbh','corp','ltd','the','app','application','launcher','client','software','technologies','technology','studio','studios','games','game','desktop','win','win64','win32','x64','x86')
+$allowlist = @(${allowlistPs})
+
+function Get-Tokens($name) {
+  if (-not $name) { return @() }
+  $lower = $name.ToLowerInvariant()
+  return @([regex]::Split($lower, '[^a-z0-9]+') | Where-Object { $_.Length -ge 3 -and ($noise -notcontains $_) })
+}
+function Get-Concat($name) {
+  if (-not $name) { return '' }
+  return ([regex]::Replace($name.ToLowerInvariant(), '[^a-z0-9]', ''))
+}
+function Test-Match($folderTokens, $folderConcat, $refTokens) {
+  if ($refTokens.Count -eq 0) { return $false }
+  if ($folderTokens.Count -gt 0) {
+    $allFolderInRef = (@($folderTokens | Where-Object { $refTokens -notcontains $_ })).Count -eq 0
+    $allRefInFolder = (@($refTokens | Where-Object { $folderTokens -notcontains $_ })).Count -eq 0
+    if ($allFolderInRef -or $allRefInFolder) { return $true }
+  }
+  if ($folderTokens.Count -eq 1 -and $folderConcat) {
+    $concatRef = ($refTokens -join '')
+    if ($concatRef -and $folderConcat.Contains($concatRef)) { return $true }
+  }
+  return $false
+}
+
+# --- Construir el conjunto de referencia (apps instaladas + procesos + accesos directos) ---
+$refNames = New-Object System.Collections.Generic.List[string]
+$uninstallRoots = @(
+  'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+)
+foreach ($root in $uninstallRoots) {
+  if (-not (Test-Path $root)) { continue }
+  Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+    if ($p.DisplayName) { $refNames.Add([string]$p.DisplayName) }
+  }
+}
+try { Get-Process -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ProcessName -Unique | ForEach-Object { $refNames.Add([string]$_) } } catch {}
+$shortcutDirs = @("$env:ProgramData\\Microsoft\\Windows\\Start Menu\\Programs", "$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs")
+foreach ($sd in $shortcutDirs) {
+  if (-not (Test-Path $sd)) { continue }
+  try { Get-ChildItem -LiteralPath $sd -Recurse -Filter *.lnk -Force -ErrorAction SilentlyContinue | ForEach-Object { $refNames.Add($_.BaseName) } } catch {}
+}
+$refs = @($refNames | Select-Object -Unique | ForEach-Object { , (Get-Tokens $_) } | Where-Object { $_.Count -gt 0 })
+
+# --- Escanear carpetas candidatas ---
+$cutoff90 = (Get-Date).AddDays(-90)
+$cutoff180 = (Get-Date).AddDays(-180)
+$roots = @(
+  @{ path = $env:APPDATA; label = 'Roaming' },
+  @{ path = $env:LOCALAPPDATA; label = 'Local' },
+  @{ path = "$env:ProgramData"; label = 'ProgramData' }
+)
+$out = New-Object System.Collections.ArrayList
+foreach ($r in $roots) {
+  if (-not (Test-Path $r.path)) { continue }
+  Get-ChildItem -LiteralPath $r.path -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    $folder = $_
+    $nameLower = $folder.Name.ToLowerInvariant()
+    if ($allowlist -contains $nameLower) { return }
+    $fTokens = Get-Tokens $folder.Name
+    $fConcat = Get-Concat $folder.Name
+    $matched = $false
+    foreach ($refTokens in $refs) {
+      if (Test-Match $fTokens $fConcat $refTokens) { $matched = $true; break }
+    }
+    if ($matched) { return }
+    # Solo se paga el coste de recorrer el contenido si ya pasó el filtro barato de arriba.
+    $size = [int64]0; $maxDate = $folder.LastWriteTime
+    try {
+      Get-ChildItem -LiteralPath $folder.FullName -Recurse -File -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $size += [int64]$_.Length
+        if ($_.LastWriteTime -gt $maxDate) { $maxDate = $_.LastWriteTime }
+      }
+    } catch {}
+    if ($size -lt 102400) { return }
+    if ($maxDate -gt $cutoff90) { return }
+    $confidence = if ($maxDate -lt $cutoff180) { 'alta' } else { 'baja' }
+    [void]$out.Add([pscustomobject]@{
+      path = $folder.FullName
+      root = $r.label
+      name = $folder.Name
+      sizeBytes = $size
+      lastModified = $maxDate.ToString('o')
+      confidence = $confidence
+    })
+  }
+}
+$out | ConvertTo-Json -Compress -Depth 4`;
+  const r = await psJson(script, { timeout: 90000, name: 'config-remnants' });
+  if (!r.ok) return { ok: false, error: r.kind === 'timeout' ? 'El escaneo tardó demasiado (cancelado)' : r.error };
+  const remnants = asArray(r.data).sort((a, b) => (b.sizeBytes || 0) - (a.sizeBytes || 0));
+  return { ok: true, data: remnants };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   CUARENTENA — nada se borra de entrada. Un resto "eliminado" se mueve a
+   %APPDATA%\vokoptimizer\quarantine\<id> con manifiesto, y desde ahí se
+   puede restaurar a su ruta exacta original o purgar (con confirmación
+   explícita del lado de la UI).
+   ═══════════════════════════════════════════════════════════════════ */
+const QUARANTINE_DIR = path.join(app.getPath('userData'), 'quarantine');
+const QUARANTINE_MANIFEST_FILE = path.join(app.getPath('userData'), 'quarantine-manifest.json');
+
+function loadQuarantineManifest() {
+  try { return JSON.parse(fs.readFileSync(QUARANTINE_MANIFEST_FILE, 'utf8')); } catch (e) { return []; }
+}
+function saveQuarantineManifest(list) {
+  try { fs.writeFileSync(QUARANTINE_MANIFEST_FILE, JSON.stringify(list, null, 2)); } catch (e) {}
+}
+
+const SYSTEM_ROOTS = [
+  (process.env.SystemDrive || 'C:') + '\\',
+  process.env.SystemRoot,
+  path.join(process.env.SystemDrive || 'C:\\', 'Program Files'),
+  path.join(process.env.SystemDrive || 'C:\\', 'Program Files (x86)'),
+  path.join(process.env.SystemDrive || 'C:\\', 'Users'),
+  process.env.APPDATA,
+  process.env.LOCALAPPDATA,
+  process.env.ProgramData,
+].filter(Boolean).map(p => path.resolve(p).toLowerCase());
+
+// C:\ProgramData\<algo> ya está a profundidad 3 y es una de las tres raíces
+// que escanea el Módulo 1b — un mínimo de 4 la habría rechazado siempre.
+// 3 sigue bloqueando cualquier raíz de sistema o su hijo directo
+// (C:\Users, C:\ProgramData, C:\Windows... todos profundidad ≤2).
+const QUARANTINE_MIN_DEPTH = 3;
+
+let cachedFixedDrives = null;
+async function getLocalFixedDrives() {
+  if (cachedFixedDrives) return cachedFixedDrives;
+  // DriveType=3 en Win32_LogicalDisk = disco local fijo (excluye red=4 y
+  // extraíbles=2). Se cachea porque las letras de unidad no cambian en
+  // mitad de una sesión de la app.
+  const r = await ps('(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction SilentlyContinue).DeviceID -join \',\'', { timeout: 8000 });
+  cachedFixedDrives = new Set((r.stdout || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+  return cachedFixedDrives;
+}
+
+async function assertSafeToQuarantine(originalPath) {
+  if (!originalPath || typeof originalPath !== 'string') return { ok: false, error: 'Ruta inválida' };
+  if (/^\\\\/.test(originalPath)) return { ok: false, error: 'No se permite mover rutas de red (UNC)' };
+
+  let real;
+  try { real = fs.realpathSync(originalPath); }
+  catch (e) { return { ok: false, error: 'No se pudo resolver la ruta real (¿ya no existe?)' }; }
+  const resolved = path.resolve(real);
+  const resolvedLower = resolved.toLowerCase();
+
+  if (SYSTEM_ROOTS.includes(resolvedLower)) return { ok: false, error: 'Esa ruta es una raíz protegida del sistema' };
+
+  const depth = resolved.split(path.sep).filter(Boolean).length;
+  if (depth < QUARANTINE_MIN_DEPTH) return { ok: false, error: 'La ruta es demasiado superficial para ser un resto seguro de mover' };
+
+  let stat;
+  try { stat = fs.statSync(resolved); } catch (e) { return { ok: false, error: 'La ruta ya no existe' }; }
+  if (!stat.isDirectory()) return { ok: false, error: 'Solo se pueden poner en cuarentena carpetas' };
+
+  const oneDriveRoots = [process.env.OneDrive, process.env.OneDriveCommercial, process.env.OneDriveConsumer]
+    .filter(Boolean).map(p => path.resolve(p).toLowerCase());
+  if (oneDriveRoots.some(r => resolvedLower === r || resolvedLower.startsWith(r + path.sep))) {
+    return { ok: false, error: 'Esa carpeta está dentro de OneDrive (sincronizada) — no se mueve automáticamente' };
+  }
+
+  const drive = path.parse(resolved).root.replace(/\\$/, '').toUpperCase();
+  const fixedDrives = await getLocalFixedDrives();
+  if (fixedDrives.size && !fixedDrives.has(drive)) {
+    return { ok: false, error: 'Esa unidad no es un disco local fijo (¿red o extraíble?)' };
+  }
+
+  return { ok: true, resolved };
+}
+
+// robocopy usa códigos de salida por bits donde 0-7 son variantes de
+// "éxito" — en vez de fiarse del exit code, se comprueba directamente si
+// el destino quedó creado tras el /MOVE.
+function robocopyMove(src, dst, timeout = 90000) {
+  const s = src.replace(/'/g, "''");
+  const d = dst.replace(/'/g, "''");
+  return ps(`
+try {
+  robocopy '${s}' '${d}' /MOVE /E /R:1 /W:1 /NFL /NDL /NJH /NJS *> $null
+  if (Test-Path -LiteralPath '${d}') { Write-Output 'OK' } else { Write-Output 'ERR:robocopy no completó el movimiento' }
+} catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout });
+}
+
+ipcMain.handle('quarantine-remnant', async (e, item) => {
+  if (!IS_WIN || !item || !item.path) return { ok: false, error: 'Datos inválidos' };
+  const guard = await assertSafeToQuarantine(item.path);
+  if (!guard.ok) return guard;
+  const original = guard.resolved;
+
+  try { fs.mkdirSync(QUARANTINE_DIR, { recursive: true }); } catch (e2) {}
+  const id = crypto.randomBytes(8).toString('hex');
+  const dest = path.join(QUARANTINE_DIR, id);
+
+  let moved = false, moveError = null;
+  try { fs.renameSync(original, dest); moved = true; }
+  catch (err) {
+    // Cruza de volumen o archivo en uso: fs.renameSync falla con EXDEV/EBUSY.
+    const r = await robocopyMove(original, dest);
+    moved = /^OK/.test(r.stdout);
+    moveError = moved ? null : (r.stdout || '').replace(/^ERR:/, '');
+  }
+  if (!moved) return { ok: false, error: moveError || 'No se pudo mover la carpeta' };
+
+  const manifest = loadQuarantineManifest();
+  manifest.unshift({
+    id, originalPath: original, label: item.name || path.basename(original),
+    sizeBytes: item.sizeBytes || 0, quarantinedAt: Date.now(),
+  });
+  saveQuarantineManifest(manifest);
+  addHistory('Cuarentena', `${item.name || path.basename(original)} movido a cuarentena`);
+  return { ok: true, id };
+});
+
+ipcMain.handle('list-quarantine', async () => ({ ok: true, data: loadQuarantineManifest() }));
+
+ipcMain.handle('restore-remnant', async (e, id) => {
+  if (!id) return { ok: false, error: 'ID inválido' };
+  const manifest = loadQuarantineManifest();
+  const entry = manifest.find(m => m.id === id);
+  if (!entry) return { ok: false, error: 'No se encontró esa entrada en cuarentena' };
+  const src = path.join(QUARANTINE_DIR, id);
+  if (!fs.existsSync(src)) return { ok: false, error: 'El contenido en cuarentena ya no existe' };
+  if (fs.existsSync(entry.originalPath)) {
+    return { ok: false, error: 'Ya existe algo en la ruta original — no se sobrescribe. Revísalo manualmente.' };
+  }
+
+  try { fs.mkdirSync(path.dirname(entry.originalPath), { recursive: true }); } catch (e2) {}
+  let moved = false, moveError = null;
+  try { fs.renameSync(src, entry.originalPath); moved = true; }
+  catch (err) {
+    const r = await robocopyMove(src, entry.originalPath);
+    moved = /^OK/.test(r.stdout);
+    moveError = moved ? null : (r.stdout || '').replace(/^ERR:/, '');
+  }
+  if (!moved) return { ok: false, error: moveError || 'No se pudo restaurar' };
+
+  saveQuarantineManifest(manifest.filter(m => m.id !== id));
+  addHistory('Cuarentena', `${entry.label} restaurado a su ruta original`);
+  return { ok: true };
+});
+
+ipcMain.handle('purge-remnant', async (e, id) => {
+  if (!id) return { ok: false, error: 'ID inválido' };
+  const manifest = loadQuarantineManifest();
+  const entry = manifest.find(m => m.id === id);
+  if (!entry) return { ok: false, error: 'No se encontró esa entrada en cuarentena' };
+  const target = path.join(QUARANTINE_DIR, id);
+  try { fs.rmSync(target, { recursive: true, force: true }); }
+  catch (err) { return { ok: false, error: 'No se pudo purgar: ' + err.message }; }
+
+  saveQuarantineManifest(manifest.filter(m => m.id !== id));
+  addHistory('Cuarentena', `${entry.label} purgado permanentemente`, { status: 'WARN' });
+  return { ok: true };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   DETECCIÓN DE JUEGOS — Steam (libraryfolders.vdf + appmanifest_*.acf),
+   Epic (Manifests/*.item), Xbox (XboxGames), Riot, y el resto vía
+   Uninstall filtrado por palabras clave de títulos conocidos.
+   ═══════════════════════════════════════════════════════════════════ */
+function normalizeGameName(name) {
+  return (name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+}
+
+ipcMain.handle('scan-games', async () => {
+  if (!IS_WIN) return { ok: false, error: 'No disponible' };
+  const script = `
+$games = New-Object System.Collections.ArrayList
+
+# --- Steam: SteamPath -> libraryfolders.vdf -> appmanifest_*.acf por biblioteca ---
+try {
+  $steamPath = (Get-ItemProperty -Path 'HKCU:\\Software\\Valve\\Steam' -Name SteamPath -ErrorAction SilentlyContinue).SteamPath
+  if ($steamPath -and (Test-Path -LiteralPath $steamPath)) {
+    $libs = New-Object System.Collections.Generic.List[string]
+    $libs.Add($steamPath)
+    $vdf = Join-Path $steamPath 'steamapps\\libraryfolders.vdf'
+    if (Test-Path -LiteralPath $vdf) {
+      $content = Get-Content -LiteralPath $vdf -Raw -ErrorAction SilentlyContinue
+      if ($content) {
+        [regex]::Matches($content, '"path"\\s*"([^"]+)"') | ForEach-Object {
+          $p = $_.Groups[1].Value -replace '\\\\\\\\', '\\'
+          if ($p -and (Test-Path -LiteralPath $p) -and (-not $libs.Contains($p))) { $libs.Add($p) }
+        }
+      }
+    }
+    foreach ($lib in $libs) {
+      $appsDir = Join-Path $lib 'steamapps'
+      if (-not (Test-Path -LiteralPath $appsDir)) { continue }
+      Get-ChildItem -LiteralPath $appsDir -Filter 'appmanifest_*.acf' -ErrorAction SilentlyContinue | ForEach-Object {
+        $c = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue
+        if (-not $c) { return }
+        $name = [regex]::Match($c, '"name"\\s*"([^"]+)"').Groups[1].Value
+        $installdir = [regex]::Match($c, '"installdir"\\s*"([^"]+)"').Groups[1].Value
+        if (-not $name -or -not $installdir) { return }
+        $loc = Join-Path $appsDir "common\\$installdir"
+        [void]$games.Add([pscustomobject]@{ name = $name; installLocation = $loc; source = 'Steam' })
+      }
+    }
+  }
+} catch {}
+
+# --- Epic Games ---
+try {
+  $epicDir = "$env:ProgramData\\Epic\\EpicGamesLauncher\\Data\\Manifests"
+  if (Test-Path -LiteralPath $epicDir) {
+    Get-ChildItem -LiteralPath $epicDir -Filter '*.item' -ErrorAction SilentlyContinue | ForEach-Object {
+      try {
+        $j = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($j -and $j.DisplayName -and $j.InstallLocation) {
+          [void]$games.Add([pscustomobject]@{ name = $j.DisplayName; installLocation = $j.InstallLocation; source = 'Epic'; launchExe = [string]$j.LaunchExecutable })
+        }
+      } catch {}
+    }
+  }
+} catch {}
+
+# --- Xbox / Game Pass: carpeta XboxGames en cada disco fijo ---
+try {
+  Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction SilentlyContinue | ForEach-Object {
+    $xb = Join-Path ($_.DeviceID + '\\') 'XboxGames'
+    if (Test-Path -LiteralPath $xb) {
+      Get-ChildItem -LiteralPath $xb -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        [void]$games.Add([pscustomobject]@{ name = $_.Name; installLocation = $_.FullName; source = 'Xbox' })
+      }
+    }
+  }
+} catch {}
+
+# --- Riot Games ---
+try {
+  $riotRoots = @('C:\\Riot Games')
+  foreach ($rr in $riotRoots) {
+    if (Test-Path -LiteralPath $rr) {
+      Get-ChildItem -LiteralPath $rr -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'Riot Client' } | ForEach-Object {
+        [void]$games.Add([pscustomobject]@{ name = $_.Name; installLocation = $_.FullName; source = 'Riot' })
+      }
+    }
+  }
+} catch {}
+
+# --- Resto (Battle.net, EA, Ubisoft, GOG...) vía Uninstall filtrado por palabra clave ---
+$keywords = @('battle.net','world of warcraft','overwatch','diablo','hearthstone','starcraft',
+  'ea app','origin','ubisoft','uplay','gog galaxy','the sims','need for speed',
+  'fortnite','counter-strike','valorant','apex legends','league of legends',
+  'call of duty','warzone','modern warfare','black ops','grand theft auto',
+  'red dead redemption','cyberpunk','minecraft','rocket league')
+$uninstallRoots = @(
+  'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall',
+  'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall'
+)
+foreach ($root in $uninstallRoots) {
+  if (-not (Test-Path $root)) { continue }
+  Get-ChildItem $root -ErrorAction SilentlyContinue | ForEach-Object {
+    $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+    if (-not $p.DisplayName) { return }
+    $lower = $p.DisplayName.ToLowerInvariant()
+    $isGame = $false
+    foreach ($kw in $keywords) { if ($lower.Contains($kw)) { $isGame = $true; break } }
+    if (-not $isGame -or -not $p.InstallLocation) { return }
+    [void]$games.Add([pscustomobject]@{ name = $p.DisplayName; installLocation = [string]$p.InstallLocation; source = 'Registro' })
+  }
+}
+
+# --- Localizar el .exe principal de cada juego ---
+function Find-MainExe($dir) {
+  if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { return $null }
+  try {
+    $candidates = Get-ChildItem -LiteralPath $dir -Recurse -Depth 3 -Filter *.exe -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -notmatch '(?i)^unins|^crash|^setup|redist|vcredist' }
+    if (-not $candidates) { return $null }
+    return ($candidates | Sort-Object Length -Descending | Select-Object -First 1).FullName
+  } catch { return $null }
+}
+foreach ($g in $games) {
+  $exe = $null
+  if ($g.source -eq 'Epic' -and $g.launchExe) {
+    $cand = Join-Path $g.installLocation $g.launchExe
+    if (Test-Path -LiteralPath $cand) { $exe = $cand }
+  }
+  if (-not $exe) { $exe = Find-MainExe $g.installLocation }
+  $g | Add-Member -NotePropertyName exePath -NotePropertyValue $exe -Force
+}
+$games | ConvertTo-Json -Compress -Depth 5`;
+  const r = await psJson(script, { timeout: 90000, name: 'games' });
+  if (!r.ok) return { ok: false, error: r.kind === 'timeout' ? 'El escaneo tardó demasiado (cancelado)' : r.error };
+
+  // Deduplicar por nombre normalizado: el mismo juego puede aparecer por
+  // Steam y de nuevo por el barrido de Uninstall (p.ej. si también tiene
+  // un acceso directo genérico registrado).
+  const byName = new Map();
+  asArray(r.data).forEach(g => {
+    if (!g.name || !g.installLocation) return;
+    const key = normalizeGameName(g.name);
+    if (!key) return;
+    const existing = byName.get(key);
+    if (!existing) {
+      byName.set(key, { name: g.name, installLocation: g.installLocation, exePath: g.exePath || null, sources: [g.source] });
+    } else {
+      if (!existing.exePath && g.exePath) existing.exePath = g.exePath;
+      if (!existing.sources.includes(g.source)) existing.sources.push(g.source);
+    }
+  });
+  const games = Array.from(byName.entries()).map(([id, g]) => ({
+    id,
+    name: g.name,
+    installLocation: g.installLocation,
+    exePath: g.exePath,
+    hasExe: !!g.exePath,
+    sources: g.sources,
+    preset: matchGamePreset(g.name),
+  })).sort((a, b) => a.name.localeCompare(b.name, 'es'));
+
+  return { ok: true, data: games };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   PERFILES DE JUEGO — presets por título + categorías genéricas.
+   ═══════════════════════════════════════════════════════════════════ */
+// Aliases en minúsculas: substrings a buscar en el nombre detectado. El
+// primero que matchea gana. Todo lo que no matchea cae en 'aaa' por
+// defecto y el usuario puede cambiarlo a mano desde la UI.
+const GAME_PRESETS = [
+  { id: 'fortnite', label: 'Fortnite', aliases: ['fortnite'], category: 'competitivo' },
+  { id: 'cs2', label: 'Counter-Strike 2', aliases: ['counter-strike 2', 'counter-strike global offensive', 'cs2', 'csgo'], category: 'competitivo' },
+  { id: 'valorant', label: 'Valorant', aliases: ['valorant'], category: 'competitivo' },
+  { id: 'apex', label: 'Apex Legends', aliases: ['apex legends'], category: 'competitivo' },
+  { id: 'lol', label: 'League of Legends', aliases: ['league of legends'], category: 'competitivo' },
+  { id: 'cod', label: 'Call of Duty', aliases: ['call of duty', 'warzone', 'modern warfare', 'black ops'], category: 'competitivo' },
+  { id: 'rocketleague', label: 'Rocket League', aliases: ['rocket league'], category: 'competitivo' },
+  { id: 'diablo4', label: 'Diablo IV', aliases: ['diablo iv', 'diablo 4'], category: 'aaa' },
+  { id: 'gta5', label: 'Grand Theft Auto V', aliases: ['grand theft auto v', 'grand theft auto 5'], category: 'aaa' },
+  { id: 'rdr2', label: 'Red Dead Redemption 2', aliases: ['red dead redemption 2'], category: 'aaa' },
+  { id: 'cyberpunk', label: 'Cyberpunk 2077', aliases: ['cyberpunk 2077', 'cyberpunk'], category: 'aaa' },
+  { id: 'minecraft', label: 'Minecraft', aliases: ['minecraft'], category: 'casual' },
+];
+function matchGamePreset(name) {
+  const lower = (name || '').toLowerCase();
+  for (const preset of GAME_PRESETS) {
+    if (preset.aliases.some(a => lower.includes(a))) return { id: preset.id, label: preset.label, category: preset.category, dedicated: true };
+  }
+  return { id: null, label: null, category: 'aaa', dedicated: false };
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   PERFILES DE JUEGO — motor de tweaks reversibles.
+   Un solo perfil activo a la vez: aplicar uno nuevo revierte por completo
+   el anterior primero (nunca coexisten dos conjuntos de tweaks
+   compitiendo por la misma clave global de MMCSS). Antes de revertir cada
+   valor se comprueba que sigue siendo el que escribimos nosotros — si
+   cambió por fuera, esa clave concreta se deja intacta y se informa.
+   ═══════════════════════════════════════════════════════════════════ */
+const GAME_LEDGER_FILE = path.join(app.getPath('userData'), 'game-tweak-ledger.json');
+function loadGameLedger() {
+  try { return JSON.parse(fs.readFileSync(GAME_LEDGER_FILE, 'utf8')); } catch (e) { return { activeProfile: null, entries: [] }; }
+}
+function saveGameLedger(state) {
+  try { fs.writeFileSync(GAME_LEDGER_FILE, JSON.stringify(state, null, 2)); } catch (e) {}
+}
+
+function buildTweakOps(category, exePath) {
+  const exeName = exePath ? path.basename(exePath) : null;
+  const ops = [];
+  const services = [];
+  let nagle = false;
+  let freeRamFirst = false;
+
+  // GPU dedicada: las tres categorías la quieren — competitivo/aaa por
+  // rendimiento máximo, casual porque apps como Java (Minecraft) suelen
+  // coger la GPU integrada por defecto si no se fuerza.
+  if (exePath) {
+    ops.push({ psPath: 'HKCU:\\Software\\Microsoft\\DirectX\\UserGpuPreferences', valueName: exePath, valueType: 'String', mode: 'set', value: 'GpuPreference=2;' });
+  }
+
+  if (category === 'competitivo') {
+    if (exePath) {
+      ops.push({ psPath: `HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\${exeName}\\PerfOptions`, valueName: 'CpuPriorityClass', valueType: 'DWord', mode: 'set', value: 3 });
+      // append-flag: nunca pisa otros compat flags que ya tuviera el exe.
+      ops.push({ psPath: 'HKCU:\\Software\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Layers', valueName: exePath, mode: 'append-flag', flag: '~ DISABLEDXMAXIMIZEDWINDOWEDMODE' });
+    }
+    ops.push({ psPath: MMCSS, valueName: 'SystemResponsiveness', valueType: 'DWord', mode: 'set', value: 10 });
+    ops.push({ psPath: MMCSS, valueName: 'NetworkThrottlingIndex', valueType: 'DWord', mode: 'set', value: 4294967295 });
+    ops.push({ psPath: MMCSS_GAMES, valueName: 'GPU Priority', valueType: 'DWord', mode: 'set', value: 8 });
+    ops.push({ psPath: MMCSS_GAMES, valueName: 'Priority', valueType: 'DWord', mode: 'set', value: 6 });
+    ops.push({ psPath: MMCSS_GAMES, valueName: 'Scheduling Category', valueType: 'String', mode: 'set', value: 'High' });
+    ops.push({ psPath: MMCSS_GAMES, valueName: 'SFIO Priority', valueType: 'String', mode: 'set', value: 'High' });
+    ops.push({ psPath: 'HKCU:\\System\\GameConfigStore', valueName: 'GameDVR_Enabled', valueType: 'DWord', mode: 'set', value: 0 });
+    services.push('SysMain', 'WSearch', 'DiagTrack');
+    nagle = true; // solo competitivo: es lo único que pide latencia de red mínima.
+  } else if (category === 'aaa') {
+    if (exePath) {
+      ops.push({ psPath: `HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\${exeName}\\PerfOptions`, valueName: 'CpuPriorityClass', valueType: 'DWord', mode: 'set', value: 3 });
+    }
+    ops.push({ psPath: MMCSS, valueName: 'SystemResponsiveness', valueType: 'DWord', mode: 'set', value: 10 });
+    ops.push({ psPath: MMCSS, valueName: 'NetworkThrottlingIndex', valueType: 'DWord', mode: 'set', value: 4294967295 });
+    ops.push({ psPath: MMCSS_GAMES, valueName: 'GPU Priority', valueType: 'DWord', mode: 'set', value: 8 });
+    ops.push({ psPath: MMCSS_GAMES, valueName: 'Priority', valueType: 'DWord', mode: 'set', value: 6 });
+    ops.push({ psPath: MMCSS_GAMES, valueName: 'Scheduling Category', valueType: 'String', mode: 'set', value: 'High' });
+    ops.push({ psPath: 'HKCU:\\System\\GameConfigStore', valueName: 'GameDVR_Enabled', valueType: 'DWord', mode: 'set', value: 0 });
+    services.push('SysMain', 'WSearch', 'DiagTrack');
+    freeRamFirst = true; // acción de un solo uso, no se registra en el ledger (no hay nada que "revertir" de liberar RAM).
+  }
+  // 'casual': nada de CPU/MMCSS/servicios/Nagle — "menos agresivo con servicios".
+  // Solo se queda con la GPU dedicada añadida arriba.
+
+  return { ops, services, nagle, freeRamFirst };
+}
+
+const PS_REG_HELPERS = `
+function RegRead($psPath, $name) {
+  $had = $false; $val = $null; $type = $null
+  if (Test-Path -LiteralPath $psPath) {
+    try {
+      $ik = Get-Item -LiteralPath $psPath -ErrorAction Stop
+      if ($ik.GetValueNames() -contains $name) {
+        $had = $true; $val = $ik.GetValue($name); $type = $ik.GetValueKind($name).ToString()
+      }
+    } catch {}
+  }
+  return @{ had = $had; value = $val; type = $type }
+}
+function RegWrite($psPath, $name, $type, $value) {
+  if (-not (Test-Path -LiteralPath $psPath)) { New-Item -Path $psPath -Force | Out-Null }
+  Set-ItemProperty -LiteralPath $psPath -Name $name -Value $value -Type $type -Force -ErrorAction Stop
+}`;
+
+async function revertActiveGameProfile() {
+  const state = loadGameLedger();
+  if (!state.activeProfile || !state.entries || !state.entries.length) {
+    saveGameLedger({ activeProfile: null, entries: [] });
+    return { ok: true, reverted: [], skipped: [], previousProfile: state.activeProfile || null };
+  }
+  const payload = JSON.stringify(state.entries);
+  const script = `
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+$entries = @([Console]::In.ReadToEnd() | ConvertFrom-Json)
+${PS_REG_HELPERS}
+$reverted = New-Object System.Collections.ArrayList
+$skipped = New-Object System.Collections.ArrayList
+foreach ($ent in $entries) {
+  try {
+    if ($ent.type -eq 'registry') {
+      $now = RegRead $ent.psPath $ent.valueName
+      $nowVal = if ($null -eq $now.value) { $null } else { [string]$now.value }
+      $expected = if ($null -eq $ent.currentValue) { $null } else { [string]$ent.currentValue }
+      $stillOurs = ($now.had -eq $true -and $nowVal -eq $expected)
+      if (-not $stillOurs) {
+        [void]$skipped.Add([pscustomobject]@{ label = "$($ent.psPath)\\$($ent.valueName)"; reason = 'modificado por otro programa' })
+        continue
+      }
+      if ($ent.hadValue) {
+        Set-ItemProperty -LiteralPath $ent.psPath -Name $ent.valueName -Value $ent.previousValue -Type $ent.previousType -Force -ErrorAction Stop
+      } else {
+        Remove-ItemProperty -LiteralPath $ent.psPath -Name $ent.valueName -Force -ErrorAction SilentlyContinue
+      }
+      [void]$reverted.Add([pscustomobject]@{ label = "$($ent.psPath)\\$($ent.valueName)" })
+    } elseif ($ent.type -eq 'service') {
+      $svc = Get-Service -Name $ent.serviceName -ErrorAction SilentlyContinue
+      if ($svc -and $ent.previousState -eq 'Running' -and $svc.Status -ne 'Running') {
+        Start-Service -Name $ent.serviceName -ErrorAction Stop
+      }
+      [void]$reverted.Add([pscustomobject]@{ label = "Servicio $($ent.serviceName)" })
+    }
+  } catch {
+    [void]$skipped.Add([pscustomobject]@{ label = "$($ent.psPath)$($ent.valueName)"; reason = $_.Exception.Message })
+  }
+}
+[pscustomobject]@{ reverted = $reverted; skipped = $skipped } | ConvertTo-Json -Compress -Depth 4`;
+  const r = await psJson(script, { timeout: 30000, input: payload });
+  const previousProfile = state.activeProfile;
+  saveGameLedger({ activeProfile: null, entries: [] });
+  if (!r.ok) return { ok: false, error: r.error, previousProfile };
+  return { ok: true, reverted: asArray(r.data.reverted), skipped: asArray(r.data.skipped), previousProfile };
+}
+
+ipcMain.handle('apply-game-profile', async (e, game, category) => {
+  if (!IS_WIN || !game) return { ok: false, error: 'Datos inválidos' };
+  const revertResult = await revertActiveGameProfile();
+
+  const { ops, services, nagle, freeRamFirst } = buildTweakOps(category, game.exePath || null);
+  const payload = JSON.stringify({ ops, services, nagle, freeRamFirst });
+  const script = `
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+$payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
+${PS_REG_HELPERS}
+$entries = New-Object System.Collections.ArrayList
+$failed = New-Object System.Collections.ArrayList
+if ($payload.freeRamFirst) {
+  try {
+    $sig = @"
+using System;
+using System.Runtime.InteropServices;
+public class VokMemGame { [DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr hProcess); }
+"@
+    Add-Type -TypeDefinition $sig -ErrorAction SilentlyContinue
+    Get-Process -ErrorAction SilentlyContinue | ForEach-Object { try { [void][VokMemGame]::EmptyWorkingSet($_.Handle) } catch {} }
+  } catch {}
+}
+foreach ($op in $payload.ops) {
+  try {
+    $before = RegRead $op.psPath $op.valueName
+    if ($op.mode -eq 'append-flag') {
+      $existing = if ($before.had -and $before.value) { [string]$before.value } else { '' }
+      $flag = [string]$op.flag
+      if ($existing -and $existing.Contains($flag)) { $newVal = $existing }
+      elseif ($existing) { $newVal = "$existing $flag" }
+      else { $newVal = $flag }
+      RegWrite $op.psPath $op.valueName 'String' $newVal
+      [void]$entries.Add([pscustomobject]@{ type='registry'; psPath=$op.psPath; valueName=$op.valueName; hadValue=$before.had; previousValue=$before.value; previousType=$before.type; currentValue=$newVal })
+    } else {
+      RegWrite $op.psPath $op.valueName $op.valueType $op.value
+      [void]$entries.Add([pscustomobject]@{ type='registry'; psPath=$op.psPath; valueName=$op.valueName; hadValue=$before.had; previousValue=$before.value; previousType=$before.type; currentValue=$op.value })
+    }
+  } catch {
+    [void]$failed.Add([pscustomobject]@{ label = "$($op.psPath)\\$($op.valueName)"; error = $_.Exception.Message })
+  }
+}
+foreach ($svcName in $payload.services) {
+  try {
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if (-not $svc) { continue }
+    if ($svc.Status -eq 'Running') {
+      Stop-Service -Name $svcName -Force -ErrorAction Stop
+      [void]$entries.Add([pscustomobject]@{ type='service'; serviceName=$svcName; previousState='Running' })
+    }
+  } catch {
+    [void]$failed.Add([pscustomobject]@{ label = "Servicio $svcName"; error = $_.Exception.Message })
+  }
+}
+if ($payload.nagle) {
+  $ifaceGuids = @()
+  try {
+    $physical = Get-CimInstance Win32_NetworkAdapter -Filter "PhysicalAdapter=True" -ErrorAction SilentlyContinue
+    $physIdx = @{}
+    foreach ($pAd in $physical) { $physIdx[$pAd.Index] = $true }
+    $configs = Get-CimInstance Win32_NetworkAdapterConfiguration -Filter "IPEnabled=True" -ErrorAction SilentlyContinue
+    foreach ($c in $configs) { if ($physIdx.ContainsKey($c.Index) -and $c.SettingID) { $ifaceGuids += $c.SettingID } }
+  } catch {}
+  $ifaceGuids = @($ifaceGuids | Select-Object -Unique)
+  foreach ($guid in $ifaceGuids) {
+    $ifPath = "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\$guid"
+    if (-not (Test-Path -LiteralPath $ifPath)) { continue }
+    foreach ($vn in @('TcpAckFrequency','TCPNoDelay')) {
+      try {
+        $before = RegRead $ifPath $vn
+        RegWrite $ifPath $vn 'DWord' 1
+        [void]$entries.Add([pscustomobject]@{ type='registry'; psPath=$ifPath; valueName=$vn; hadValue=$before.had; previousValue=$before.value; previousType=$before.type; currentValue=1; iface=$guid })
+      } catch {
+        [void]$failed.Add([pscustomobject]@{ label = "Nagle $guid\\$vn"; error = $_.Exception.Message })
+      }
+    }
+  }
+}
+[pscustomobject]@{ entries = $entries; failed = $failed } | ConvertTo-Json -Compress -Depth 6`;
+  const r = await psJson(script, { timeout: 30000, input: payload });
+  if (!r.ok) {
+    return { ok: false, error: r.error, revertedPrevious: revertResult };
+  }
+  const entries = asArray(r.data.entries);
+  const failed = asArray(r.data.failed);
+  saveGameLedger({
+    activeProfile: { gameId: game.id, gameName: game.name, category, exePath: game.exePath || null, appliedAt: Date.now() },
+    entries,
+  });
+  addHistory('Perfil de juego', `${game.name} — ${category}`, { status: failed.length ? 'WARN' : 'OK' });
+  return { ok: true, applied: entries.length, failed, revertedPrevious: revertResult };
+});
+
+ipcMain.handle('revert-game-profile', async () => {
+  const r = await revertActiveGameProfile();
+  if (r.previousProfile) addHistory('Perfil de juego', `${r.previousProfile.gameName} — optimización revertida`, { status: r.ok ? 'OK' : 'WARN' });
+  return r;
+});
+
+ipcMain.handle('get-active-game-profile', async () => {
+  const state = loadGameLedger();
+  return { ok: true, data: state.activeProfile };
 });
 
 /* ═══════════════════════════════════════════════════════════════════

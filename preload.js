@@ -60,4 +60,23 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getHistory:   () => ipcRenderer.invoke('get-history'),
   clearHistory: () => ipcRenderer.invoke('clear-history'),
   openBackups:  () => ipcRenderer.invoke('open-backups'),
+
+  // escaneos largos cancelables (apps sin usar, restos, juegos)
+  cancelScan: (name) => ipcRenderer.invoke('cancel-scan', name),
+
+  // apps sin usar + restos de configuración
+  scanUnusedApps:    ()        => ipcRenderer.invoke('scan-unused-apps'),
+  openAppFolder:     (path_)   => ipcRenderer.invoke('open-app-folder', path_),
+  uninstallApp:      (appInfo) => ipcRenderer.invoke('uninstall-app', appInfo),
+  scanConfigRemnants:()        => ipcRenderer.invoke('scan-config-remnants'),
+  quarantineRemnant: (item)    => ipcRenderer.invoke('quarantine-remnant', item),
+  listQuarantine:    ()        => ipcRenderer.invoke('list-quarantine'),
+  restoreRemnant:    (id)      => ipcRenderer.invoke('restore-remnant', id),
+  purgeRemnant:      (id)      => ipcRenderer.invoke('purge-remnant', id),
+
+  // perfiles de juego
+  scanGames:            ()               => ipcRenderer.invoke('scan-games'),
+  applyGameProfile:     (game, category) => ipcRenderer.invoke('apply-game-profile', game, category),
+  revertGameProfile:    ()               => ipcRenderer.invoke('revert-game-profile'),
+  getActiveGameProfile: ()               => ipcRenderer.invoke('get-active-game-profile'),
 });

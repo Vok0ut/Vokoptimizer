@@ -101,6 +101,43 @@ const ErrorState=({message,onRetry})=>(<div style={{display:'flex',flexDirection
   {onRetry&&<button onClick={onRetry} className="btn-ghost" style={{padding:'6px 14px',border:'1.5px solid #6a3a3a',background:'transparent',color:'#ff9a9a',fontSize:10,letterSpacing:1,textTransform:'uppercase'}}>REINTENTAR</button>}
 </div>);
 
+// Escaneos largos (apps sin usar, restos de config, juegos): progreso
+// visible (cronómetro, no spinner mudo), cancelable vía cancel-scan, y el
+// propio timeout de main.js corta el PS si se cuelga. `cancelName` es la
+// clave con la que main.js registró el proceso powershell.exe en vuelo.
+function useCancelableScan(cancelName){
+  const [scanning,setScanning]=useState(false);
+  const [error,setError]=useState(null);
+  const [elapsed,setElapsed]=useState(0);
+  const timerRef=useRef();
+  const run=useCallback(async(fn)=>{
+    setScanning(true);setError(null);setElapsed(0);
+    const t0=Date.now();
+    timerRef.current=setInterval(()=>setElapsed(Math.round((Date.now()-t0)/1000)),1000);
+    let result=null;
+    try{
+      const r=await fn();
+      if(r&&r.ok===false)setError(r.error||'El escaneo falló');
+      else result=(r&&r.data!==undefined)?r.data:r;
+    }catch(e){setError('Error inesperado durante el escaneo');}
+    clearInterval(timerRef.current);
+    setScanning(false);
+    return result;
+  },[]);
+  const cancel=useCallback(()=>{if(api&&api.cancelScan)api.cancelScan(cancelName);},[cancelName]);
+  useEffect(()=>()=>clearInterval(timerRef.current),[]);
+  return {scanning,error,elapsed,run,cancel};
+}
+function ScanProgress({label,elapsed,onCancel}){
+  return(<div style={{marginBottom:16,border:'1.5px solid #303030',padding:'12px 16px'}} className="fade-in">
+    <div style={{fontSize:11,color:'#a8a8a8',letterSpacing:1,marginBottom:10,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <span>{label} — {elapsed}s<span className="blink">_</span></span>
+      <button onClick={onCancel} style={{fontSize:10,color:'#ff9a9a',background:'none',border:'1px solid #6a3a3a',padding:'3px 10px',cursor:'pointer',letterSpacing:1}}>CANCELAR</button>
+    </div>
+    <div className="scanbar"/>
+  </div>);
+}
+
 function BarRow({label,value,max=100,width=24}){
   const av=useAnimatedNumber(value,700);
   const pct=Math.round((av/max)*100);
@@ -383,6 +420,257 @@ function FileCleaner(){
       </div>
     </div>
   );
+}
+
+/* ── Apps sin usar + Restos de configuración (REAL) ── */
+function daysAgo(iso){ return Math.floor((Date.now()-new Date(iso).getTime())/86400000); }
+function fmtLastUsed(a){
+  if(!a.lastUsed)return 'Sin datos';
+  const d=daysAgo(a.lastUsed);
+  const txt=d<=0?'Hoy':d===1?'Hace 1 día':`Hace ${d} días`;
+  return a.approximate?txt+' (aprox.)':txt;
+}
+
+function UnusedAppsTab(){
+  const [apps,setApps]=useState([]);
+  const [warning,setWarning]=useState(null);
+  const [scanned,setScanned]=useState(false);
+  const {scanning,error,elapsed,run,cancel}=useCancelableScan('unused-apps');
+  const scan=useCallback(async()=>{
+    if(!api){setScanned(true);return;}
+    const data=await run(()=>api.scanUnusedApps());
+    if(data){setApps(data.apps||[]);setWarning(data.warning||null);setScanned(true);}
+  },[run]);
+  useEffect(()=>{scan();},[scan]);
+  const openFolder=(loc)=>{
+    if(!loc){toast('Esta app no tiene carpeta de instalación registrada','err');return;}
+    api&&api.openAppFolder(loc);
+  };
+  const uninstall=async(a)=>{
+    const ok=await confirmDialog({
+      title:'Lanzar desinstalador',
+      lines:[`Se abrirá el desinstalador oficial de "${a.name}".`],
+      detail:'Vokoptimizer no borra nada por su cuenta — sigue el proceso del propio instalador (puede pedir confirmación).',
+      confirmLabel:'ABRIR DESINSTALADOR',
+    });
+    if(!ok)return;
+    const r=await api.uninstallApp(a);
+    if(r&&r.ok)toast('Desinstalador lanzado','ok');else toast((r&&r.error)||'No se pudo lanzar','err');
+  };
+  return(<div>
+    {warning&&<div style={{marginBottom:16,border:'1.5px solid #4a3a1a',background:'#151005',padding:'10px 14px',fontSize:11,color:'#e0b866'}}>⚠ {warning}</div>}
+    {scanning&&<ScanProgress label="ESCANEANDO PREFETCH + REGISTRO" elapsed={elapsed} onCancel={cancel}/>}
+    {!scanning&&error&&<ErrorState message={error} onRetry={scan}/>}
+    {!scanning&&!error&&scanned&&<div style={{border:'1.5px solid #262626'}}>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 100px 120px 190px',padding:'8px 16px',borderBottom:'1.5px solid #262626',fontSize:10,fontWeight:600,color:'#b5b5b5',letterSpacing:2,textTransform:'uppercase'}}>
+        <span>APP</span><span>TAMAÑO</span><span>ÚLTIMO USO</span><span>ACCIÓN</span>
+      </div>
+      {apps.map((a,i)=>(
+        <div key={i} className="row-in" style={{'--i':Math.min(i,20),display:'grid',gridTemplateColumns:'1fr 100px 120px 190px',padding:'10px 16px',borderBottom:'1px solid #1f1f1f',fontSize:11,alignItems:'center'}}>
+          <span style={{color:'#e5e5e5',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={a.name}>{a.name}
+            {a.publisher&&<div style={{fontSize:10,color:'#7e7e7e',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{a.publisher}</div>}
+          </span>
+          <span style={{color:'#9c9c9c'}}>{a.sizeBytes?fmtBytes(a.sizeBytes):'—'}</span>
+          <span style={{color:a.hasUsageData?'#9c9c9c':'#7e7e7e',fontSize:10}}>{fmtLastUsed(a)}</span>
+          <span style={{display:'flex',gap:6}}>
+            <button onClick={()=>openFolder(a.installLocation)} style={{fontSize:10,padding:'4px 8px',border:'1px solid #3a3a3a',background:'transparent',color:'#9c9c9c'}}>CARPETA</button>
+            <button onClick={()=>uninstall(a)} style={{fontSize:10,padding:'4px 8px',border:'1px solid #3a3a3a',background:'transparent',color:'#9c9c9c'}}>DESINSTALAR</button>
+          </span>
+        </div>
+      ))}
+      {apps.length===0&&<div style={{padding:'24px 16px',textAlign:'center',fontSize:11,color:'#6e6e6e'}}>No se encontraron apps que revisar</div>}
+    </div>}
+    <div style={{marginTop:18}}>
+      <button className="btn-ghost" onClick={scan} disabled={scanning} style={{padding:'10px 22px',border:'1.5px solid #5a5a5a',background:'transparent',color:scanning?'#6e6e6e':'#9c9c9c',fontSize:11,letterSpacing:2,textTransform:'uppercase'}}>RE-ESCANEAR</button>
+    </div>
+  </div>);
+}
+
+function RemnantsTab(){
+  const [remnants,setRemnants]=useState([]);
+  const [scanned,setScanned]=useState(false);
+  const [quarantine,setQuarantine]=useState([]);
+  const {scanning,error,elapsed,run,cancel}=useCancelableScan('config-remnants');
+  const loadQuarantine=useCallback(async()=>{
+    if(!api)return;
+    const r=await api.listQuarantine();
+    setQuarantine((r&&r.data)||[]);
+  },[]);
+  const scan=useCallback(async()=>{
+    if(!api){setScanned(true);return;}
+    const data=await run(()=>api.scanConfigRemnants());
+    if(data){setRemnants(data);setScanned(true);}
+  },[run]);
+  useEffect(()=>{scan();loadQuarantine();},[scan,loadQuarantine]);
+
+  const quarantineOne=async(r)=>{
+    const ok=await confirmDialog({
+      title:'Mover a cuarentena',
+      lines:[`"${r.name}" — ${fmtBytes(r.sizeBytes)}`,r.confidence==='baja'?'Confianza BAJA: no hay certeza de que esto sea un resto real.':'Confianza ALTA: no coincide con nada instalado ni en uso.'],
+      detail:'Se mueve a una carpeta de cuarentena — no se borra. Se puede restaurar a su ruta exacta en cualquier momento desde esta pantalla.',
+      confirmLabel:'MOVER A CUARENTENA',
+    });
+    if(!ok)return;
+    const res=await runAction('Cuarentena',api.quarantineRemnant(r));
+    if(res&&res.ok){setRemnants(p=>p.filter(x=>x.path!==r.path));loadQuarantine();}
+  };
+  const restore=async(q)=>{ const res=await runAction('Restaurar',api.restoreRemnant(q.id)); if(res&&res.ok)loadQuarantine(); };
+  const purge=async(q)=>{
+    const ok=await confirmDialog({title:'Purgar definitivamente',lines:[`"${q.label}" — ${fmtBytes(q.sizeBytes)}`],detail:'Esto sí es irreversible: se borra por completo, sin copia en ningún sitio.',danger:true,confirmLabel:'BORRAR DEFINITIVAMENTE'});
+    if(!ok)return;
+    const res=await runAction('Purgar',api.purgeRemnant(q.id));
+    if(res&&res.ok)loadQuarantine();
+  };
+
+  return(<div>
+    {scanning&&<ScanProgress label="ANALIZANDO APPDATA / PROGRAMDATA" elapsed={elapsed} onCancel={cancel}/>}
+    {!scanning&&error&&<ErrorState message={error} onRetry={scan}/>}
+    {!scanning&&!error&&scanned&&<div style={{border:'1.5px solid #262626',marginBottom:24}}>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 90px 90px 100px 130px',padding:'8px 16px',borderBottom:'1.5px solid #262626',fontSize:10,fontWeight:600,color:'#b5b5b5',letterSpacing:2,textTransform:'uppercase'}}>
+        <span>CARPETA</span><span>TAMAÑO</span><span>ORIGEN</span><span>CONFIANZA</span><span>ACCIÓN</span>
+      </div>
+      {remnants.map((r,i)=>(
+        <div key={r.path} className="row-in" style={{'--i':Math.min(i,20),display:'grid',gridTemplateColumns:'1fr 90px 90px 100px 130px',padding:'10px 16px',borderBottom:'1px solid #1f1f1f',fontSize:11,alignItems:'center'}}>
+          <span style={{color:'#e5e5e5',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={r.path}>{r.name}</span>
+          <span style={{color:'#9c9c9c'}}>{fmtBytes(r.sizeBytes)}</span>
+          <span style={{color:'#8a8a8a',fontSize:10}}>{r.root}</span>
+          <span style={{fontSize:10,letterSpacing:1,fontWeight:700,color:r.confidence==='alta'?'#88ddaa':'#bb9955'}}>{r.confidence==='alta'?'ALTA':'BAJA'}</span>
+          <button onClick={()=>quarantineOne(r)} style={{fontSize:10,padding:'4px 8px',border:'1px solid #3a3a3a',background:'transparent',color:'#9c9c9c'}}>CUARENTENA</button>
+        </div>
+      ))}
+      {remnants.length===0&&<div style={{padding:'24px 16px',textAlign:'center',fontSize:11,color:'#6e6e6e'}}>No se encontraron restos de configuración</div>}
+    </div>}
+    <div style={{marginBottom:24}}>
+      <button className="btn-ghost" onClick={scan} disabled={scanning} style={{padding:'10px 22px',border:'1.5px solid #5a5a5a',background:'transparent',color:scanning?'#6e6e6e':'#9c9c9c',fontSize:11,letterSpacing:2,textTransform:'uppercase'}}>RE-ESCANEAR</button>
+    </div>
+    <div style={{borderTop:'1.5px solid #262626',paddingTop:18}}>
+      <SLabel>Cuarentena ({quarantine.length})</SLabel>
+      {quarantine.length===0&&<div style={{fontSize:11,color:'#6e6e6e',padding:'6px 0 14px'}}>Nada en cuarentena todavía</div>}
+      {quarantine.map(q=>(
+        <div key={q.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 0',borderBottom:'1px solid #1f1f1f'}}>
+          <span style={{fontSize:11,color:'#c5c5c5'}}>{q.label}<span style={{color:'#7e7e7e',marginLeft:8,fontSize:10}}>{fmtBytes(q.sizeBytes)} · {fmtDate(q.quarantinedAt)}</span></span>
+          <span style={{display:'flex',gap:8}}>
+            <button onClick={()=>restore(q)} style={{fontSize:10,padding:'4px 10px',border:'1px solid #3a5a3a',background:'transparent',color:'#88ddaa'}}>RESTAURAR</button>
+            <button onClick={()=>purge(q)} style={{fontSize:10,padding:'4px 10px',border:'1px solid #5a3a3a',background:'transparent',color:'#ff9a9a'}}>PURGAR</button>
+          </span>
+        </div>
+      ))}
+    </div>
+  </div>);
+}
+
+function AppsPanel(){
+  const [tab,setTab]=useState('unused');
+  return(
+    <div style={{height:'100%',overflowY:'auto',padding:'24px 28px'}} className="fade-in">
+      <div style={{display:'flex',gap:0,borderBottom:'1.5px solid #262626',marginBottom:24}}>
+        {[['unused','Apps sin usar'],['remnants','Restos de configuración']].map(([id,lb])=>(
+          <button key={id} onClick={()=>setTab(id)} style={{padding:'8px 20px',border:'none',borderBottom:tab===id?'2px solid #fff':'2px solid transparent',background:'transparent',color:tab===id?'#fff':'#8a8a8a',fontSize:11,letterSpacing:2,textTransform:'uppercase',cursor:'pointer',marginBottom:-1.5}}>{lb}</button>
+        ))}
+      </div>
+      {tab==='unused'&&<UnusedAppsTab/>}
+      {tab==='remnants'&&<RemnantsTab/>}
+    </div>
+  );
+}
+
+/* ── Perfiles de juego (REAL) ──────── */
+const GAME_CATEGORY_LABELS={competitivo:'Competitivo (latencia)',aaa:'AAA (rendimiento)',casual:'Casual (ligero)'};
+
+function GamesPanel(){
+  const [games,setGames]=useState([]);
+  const [scanned,setScanned]=useState(false);
+  const [categories,setCategories]=useState({});
+  const [activeProfile,setActiveProfile]=useState(null);
+  const [busyId,setBusyId]=useState(null);
+  const [lastResult,setLastResult]=useState(null);
+  const {scanning,error,elapsed,run,cancel}=useCancelableScan('games');
+
+  const loadActive=useCallback(async()=>{
+    if(!api)return;
+    const r=await api.getActiveGameProfile();
+    setActiveProfile((r&&r.data)||null);
+  },[]);
+
+  const scan=useCallback(async()=>{
+    if(!api){setScanned(true);return;}
+    const data=await run(()=>api.scanGames());
+    if(data){
+      setGames(data);
+      setCategories(prev=>{
+        const next={...prev};
+        data.forEach(g=>{ if(!(g.id in next)) next[g.id]=g.preset.category; });
+        return next;
+      });
+      setScanned(true);
+    }
+  },[run]);
+
+  useEffect(()=>{scan();loadActive();},[scan,loadActive]);
+
+  const apply=async(g)=>{
+    setBusyId(g.id);setLastResult(null);
+    const category=categories[g.id]||g.preset.category;
+    const r=await api.applyGameProfile(g,category);
+    setBusyId(null);
+    if(r&&r.ok){
+      if(r.applied===0)toast(`${g.name}: no había ningún ajuste que aplicar para "${GAME_CATEGORY_LABELS[category]}" sin ejecutable detectado`,'info');
+      else toast(`${g.name} optimizado (${GAME_CATEGORY_LABELS[category]})`,'ok');
+      setLastResult({gameName:g.name,failed:r.failed||[]});
+      loadActive();
+    }else{
+      toast((r&&r.error)||'No se pudo aplicar la optimización','err');
+    }
+  };
+  const revert=async()=>{
+    setBusyId('__revert__');
+    const r=await api.revertGameProfile();
+    setBusyId(null);
+    if(r&&r.ok){
+      toast('Optimización revertida','ok');
+      if(r.skipped&&r.skipped.length)toast(`${r.skipped.length} valores no se revirtieron: los modificó otro programa`,'err');
+      setActiveProfile(null);
+    }else{
+      toast((r&&r.error)||'No se pudo revertir','err');
+    }
+  };
+
+  return(<div style={{height:'100%',overflowY:'auto',padding:'24px 28px'}} className="fade-in">
+    {activeProfile&&<div style={{marginBottom:16,border:'1.5px solid #3a5a3a',background:'#0a1208',padding:'12px 16px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+      <span style={{fontSize:11,color:'#88ddaa'}}>● {activeProfile.gameName} — optimizado ({GAME_CATEGORY_LABELS[activeProfile.category]||activeProfile.category})</span>
+      <button onClick={revert} disabled={busyId==='__revert__'} style={{fontSize:10,padding:'6px 14px',border:'1px solid #5a3a3a',background:'transparent',color:'#ff9a9a'}}>{busyId==='__revert__'?'REVIRTIENDO...':'QUITAR OPTIMIZACIÓN'}</button>
+    </div>}
+    {lastResult&&lastResult.failed.length>0&&<div style={{marginBottom:16,border:'1.5px solid #4a3a1a',background:'#151005',padding:'10px 14px',fontSize:11,color:'#e0b866'}}>
+      ⚠ {lastResult.gameName}: {lastResult.failed.length} ajustes no se pudieron aplicar (posible falta de permisos):
+      <ul style={{margin:'6px 0 0',paddingLeft:18}}>{lastResult.failed.map((f,i)=>(<li key={i}>{f.label}: {f.error}</li>))}</ul>
+    </div>}
+    {scanning&&<ScanProgress label="BUSCANDO JUEGOS INSTALADOS" elapsed={elapsed} onCancel={cancel}/>}
+    {!scanning&&error&&<ErrorState message={error} onRetry={scan}/>}
+    {!scanning&&!error&&scanned&&<div style={{border:'1.5px solid #262626'}}>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 130px 150px',padding:'8px 16px',borderBottom:'1.5px solid #262626',fontSize:10,fontWeight:600,color:'#b5b5b5',letterSpacing:2,textTransform:'uppercase'}}>
+        <span>JUEGO</span><span>CATEGORÍA</span><span>ACCIÓN</span>
+      </div>
+      {games.map(g=>(
+        <div key={g.id} className="row-in" style={{display:'grid',gridTemplateColumns:'1fr 130px 150px',padding:'10px 16px',borderBottom:'1px solid #1f1f1f',fontSize:11,alignItems:'center'}}>
+          <span style={{color:'#e5e5e5'}}>{g.name}
+            <div style={{fontSize:10,color:'#7e7e7e'}}>{g.sources.join(' + ')}{!g.hasExe&&' · sin ejecutable detectado (solo ajustes globales)'}</div>
+          </span>
+          <select value={categories[g.id]||g.preset.category} onChange={e=>setCategories(p=>({...p,[g.id]:e.target.value}))}>
+            <option value="competitivo">Competitivo</option>
+            <option value="aaa">AAA</option>
+            <option value="casual">Casual</option>
+          </select>
+          <button onClick={()=>apply(g)} disabled={busyId===g.id} style={{fontSize:10,padding:'6px 10px',border:'1px solid #3a3a3a',background:'transparent',color:'#9c9c9c'}}>
+            {busyId===g.id?'APLICANDO...':(activeProfile&&activeProfile.gameId===g.id)?'RE-APLICAR':'OPTIMIZAR'}
+          </button>
+        </div>
+      ))}
+      {games.length===0&&<div style={{padding:'24px 16px',textAlign:'center',fontSize:11,color:'#6e6e6e'}}>No se detectaron juegos instalados</div>}
+    </div>}
+    <div style={{marginTop:18}}>
+      <button className="btn-ghost" onClick={scan} disabled={scanning} style={{padding:'10px 22px',border:'1.5px solid #5a5a5a',background:'transparent',color:scanning?'#6e6e6e':'#9c9c9c',fontSize:11,letterSpacing:2,textTransform:'uppercase'}}>RE-ESCANEAR</button>
+    </div>
+  </div>);
 }
 
 /* ── Services (REAL) ───────────────── */
@@ -681,7 +969,7 @@ function History(){
 }
 
 /* ── Orbital Menu ──────────────────── */
-const TOOLS=[{id:'dashboard',label:'Dashboard',sub:'Estado general'},{id:'files',label:'Limpiar archivos',sub:'Escaneo real de disco'},{id:'services',label:'Servicios',sub:'Servicios del sistema'},{id:'startup',label:'Arranque',sub:'Programas de inicio'},{id:'cpu',label:'CPU / RAM',sub:'Optimización memoria'},{id:'registry',label:'Mantenimiento',sub:'Registro y reparación'},{id:'monitor',label:'Monitoreo',sub:'Tiempo real'},{id:'history',label:'Historial',sub:'Operaciones'}];
+const TOOLS=[{id:'dashboard',label:'Dashboard',sub:'Estado general'},{id:'files',label:'Limpiar archivos',sub:'Escaneo real de disco'},{id:'apps',label:'Apps y restos',sub:'Software arrastrado'},{id:'services',label:'Servicios',sub:'Servicios del sistema'},{id:'startup',label:'Arranque',sub:'Programas de inicio'},{id:'cpu',label:'CPU / RAM',sub:'Optimización memoria'},{id:'games',label:'Perfiles de juego',sub:'Optimización por título'},{id:'registry',label:'Mantenimiento',sub:'Registro y reparación'},{id:'monitor',label:'Monitoreo',sub:'Tiempo real'},{id:'history',label:'Historial',sub:'Operaciones'}];
 
 // Monochrome stroke icons (SVG) — consistent rendering, no emoji fallback
 function Icon({id,size=20}){
@@ -690,9 +978,11 @@ function Icon({id,size=20}){
   switch(id){
     case 'dashboard':return(<svg style={s} viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="7" height="7" {...p}/><rect x="13.5" y="3.5" width="7" height="7" {...p}/><rect x="3.5" y="13.5" width="7" height="7" {...p}/><rect x="13.5" y="13.5" width="7" height="7" {...p}/></svg>);
     case 'files':return(<svg style={s} viewBox="0 0 24 24"><path d="M6.5 3.5 h8 l4 4 v13 h-12 z" {...p}/><path d="M14.5 3.5 v4 h4" {...p}/><path d="M9 12h6M9 15.5h6" {...p}/></svg>);
+    case 'apps':return(<svg style={s} viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="1" {...p}/><path d="M8 9h8M8 12.5h8M8 16h5" {...p}/></svg>);
     case 'services':return(<svg style={s} viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.5" {...p}/><path d="M12 2.5v3.2M12 18.3v3.2M2.5 12h3.2M18.3 12h3.2M5.3 5.3l2.2 2.2M16.5 16.5l2.2 2.2M18.7 5.3l-2.2 2.2M7.5 16.5l-2.2 2.2" {...p}/></svg>);
     case 'startup':return(<svg style={s} viewBox="0 0 24 24"><path d="M12 3 v8" {...p}/><path d="M7.5 6.2 a7 7 0 1 0 9 0" {...p}/></svg>);
     case 'cpu':return(<svg style={s} viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" {...p}/><rect x="10.5" y="10.5" width="3" height="3" {...p}/><path d="M9.5 2.5v4M14.5 2.5v4M9.5 17.5v4M14.5 17.5v4M2.5 9.5h4M2.5 14.5h4M17.5 9.5h4M17.5 14.5h4" {...p}/></svg>);
+    case 'games':return(<svg style={s} viewBox="0 0 24 24"><rect x="2.5" y="8" width="19" height="10" rx="3" {...p}/><path d="M7 11v4M5 13h4" {...p}/><circle cx="16" cy="12" r="1" fill="currentColor" stroke="none"/><circle cx="18.5" cy="14.5" r="1" fill="currentColor" stroke="none"/></svg>);
     case 'registry':return(<svg style={s} viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h16" {...p}/><circle cx="9.5" cy="6.5" r="1.8" {...p}/><circle cx="15" cy="12" r="1.8" {...p}/><circle cx="7.5" cy="17.5" r="1.8" {...p}/></svg>);
     case 'monitor':return(<svg style={s} viewBox="0 0 24 24"><path d="M2.5 13 h4.5 l2.5 -7 4 12 2.5 -7 h5.5" {...p}/></svg>);
     case 'history':return(<svg style={s} viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" {...p}/><path d="M12 7.5 v4.5 l3.5 2" {...p}/></svg>);
@@ -805,7 +1095,7 @@ function TitleBar(){
   );
 }
 
-const PAGE_TITLES={dashboard:'Panel de control',files:'Limpiador de archivos',services:'Gestor de servicios',startup:'Gestor de arranque',cpu:'Optimización CPU / RAM',registry:'Mantenimiento del sistema',monitor:'Monitoreo de recursos',history:'Historial de optimizaciones'};
+const PAGE_TITLES={dashboard:'Panel de control',files:'Limpiador de archivos',apps:'Apps y restos',services:'Gestor de servicios',startup:'Gestor de arranque',cpu:'Optimización CPU / RAM',games:'Perfiles de juego',registry:'Mantenimiento del sistema',monitor:'Monitoreo de recursos',history:'Historial de optimizaciones'};
 
 /* ── App ───────────────────────────── */
 function App(){
@@ -839,9 +1129,11 @@ function App(){
           <div style={{flex:1,overflow:'hidden'}}>
             {view==='dashboard'&&<Dashboard onOptimize={handleOpt} optimizing={optimizing} optimized={optimized} metrics={metrics}/>}
             {view==='files'&&<FileCleaner/>}
+            {view==='apps'&&<AppsPanel/>}
             {view==='services'&&<Services/>}
             {view==='startup'&&<StartupManager/>}
             {view==='cpu'&&<CpuOptimizer metrics={metrics}/>}
+            {view==='games'&&<GamesPanel/>}
             {view==='registry'&&<RegistryCleaner/>}
             {view==='monitor'&&<MonitorPanel metrics={metrics}/>}
             {view==='history'&&<History/>}
