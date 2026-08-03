@@ -48,7 +48,14 @@ function saveSettings(patch) {
 // contrario. Node decodifica stdout como UTF-8 por defecto, así que sin
 // esto cualquier acento/ñ en nombres de servicios, rutas o entradas de
 // registro llegaba corrupto al renderer.
-const PS_FORCE_UTF8 = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n";
+// [Console]::OutputEncoding sola no basta: solo gobierna cómo escribe la
+// consola interactiva. Cuando la salida está redirigida (que es siempre
+// nuestro caso — Node captura stdout por una tubería), PowerShell decide la
+// codificación de lo que manda por esa tubería con la variable $OutputEncoding,
+// que es otra cosa distinta. Sin fijar ambas, cualquier carácter fuera de
+// ASCII (tildes, ñ, ™, etc.) llegaba mal decodificado — DARK SOULS™ se veía
+// como "DARK SOULSâ„¢".
+const PS_FORCE_UTF8 = "$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)\n";
 // Escaneos largos (apps sin usar, restos de configuración, juegos) se
 // registran aquí por nombre mientras están en vuelo, para que cancel-scan
 // pueda matarlos desde la UI. Los handlers de ps()/psJson() sin `name` no
@@ -1506,12 +1513,25 @@ try {
 } catch {}
 
 # --- Xbox / Game Pass: carpeta XboxGames en cada disco fijo ---
+# XboxGames también puede contener carpetas que no son juegos (p.ej.
+# "GameSave", datos de sincronización de partidas guardadas). Un juego de
+# verdad tiene la carpeta "Content" característica de los paquetes de Game
+# Pass PC, o al menos pesa lo bastante como para no ser solo datos de guardado.
 try {
   Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" -ErrorAction SilentlyContinue | ForEach-Object {
     $xb = Join-Path ($_.DeviceID + '\\') 'XboxGames'
     if (Test-Path -LiteralPath $xb) {
       Get-ChildItem -LiteralPath $xb -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-        [void]$games.Add([pscustomobject]@{ name = $_.Name; installLocation = $_.FullName; source = 'Xbox' })
+        $looksLikeGame = Test-Path -LiteralPath (Join-Path $_.FullName 'Content')
+        if (-not $looksLikeGame) {
+          try {
+            $sizeSample = (Get-ChildItem -LiteralPath $_.FullName -Recurse -Depth 2 -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+            if ($sizeSample -ge 50MB) { $looksLikeGame = $true }
+          } catch {}
+        }
+        if ($looksLikeGame) {
+          [void]$games.Add([pscustomobject]@{ name = $_.Name; installLocation = $_.FullName; source = 'Xbox' })
+        }
       }
     }
   }
@@ -1576,21 +1596,51 @@ $games | ConvertTo-Json -Compress -Depth 5`;
   const r = await psJson(script, { timeout: 90000, name: 'games' });
   if (!r.ok) return { ok: false, error: r.kind === 'timeout' ? 'El escaneo tardó demasiado (cancelado)' : r.error };
 
-  // Deduplicar por nombre normalizado: el mismo juego puede aparecer por
-  // Steam y de nuevo por el barrido de Uninstall (p.ej. si también tiene
-  // un acceso directo genérico registrado).
+  // Ruido conocido que aparece mezclado con juegos reales:
+  // - Steamworks Common Redistributables y similares: appmanifest de
+  //   Steam para paquetes de dependencias compartidas, no un juego.
+  // - Los propios lanzadores (Battle.net, Ubisoft Connect...) matchean sus
+  //   propias palabras clave en el barrido de Uninstall y se cuelan como
+  //   si fueran un juego más.
+  const STEAM_NONGAME_BLOCKLIST = new Set(['steamworks common redistributables', 'steam linux runtime']);
+  const LAUNCHER_BLOCKLIST = new Set(['battle net', 'ubisoft connect', 'uplay', 'ea app', 'origin', 'gog galaxy', 'epic games launcher', 'steam', 'riot client']);
+  const isLauncherName = name => /\blauncher\b/i.test(name || '') || LAUNCHER_BLOCKLIST.has(normalizeGameName(name));
+  const raw = asArray(r.data).filter(g => {
+    if (!g.name || !g.installLocation) return false;
+    const norm = normalizeGameName(g.name);
+    if (!norm) return false;
+    if (g.source === 'Steam' && STEAM_NONGAME_BLOCKLIST.has(norm)) return false;
+    if (isLauncherName(g.name)) return false;
+    return true;
+  });
+
+  // Deduplicar por nombre normalizado — el mismo juego puede aparecer por
+  // Steam y de nuevo por el barrido de Uninstall — y además colapsar DLC o
+  // contenido descargable que algunos lanzadores (Epic, Xbox) registran
+  // como manifiestos separados: "Fortnite_JunoContent" o "Dying Light The
+  // Bozak" se tratan como parte de "Fortnite" / "Dying Light" en vez de
+  // aparecer como juegos independientes. Se ordena por longitud de nombre
+  // para procesar primero los nombres base más cortos.
+  const sorted = [...raw].sort((a, b) => normalizeGameName(a.name).length - normalizeGameName(b.name).length);
   const byName = new Map();
-  asArray(r.data).forEach(g => {
-    if (!g.name || !g.installLocation) return;
+  const baseKeys = [];
+  sorted.forEach(g => {
     const key = normalizeGameName(g.name);
-    if (!key) return;
     const existing = byName.get(key);
-    if (!existing) {
-      byName.set(key, { name: g.name, installLocation: g.installLocation, exePath: g.exePath || null, sources: [g.source] });
-    } else {
+    if (existing) {
       if (!existing.exePath && g.exePath) existing.exePath = g.exePath;
       if (!existing.sources.includes(g.source)) existing.sources.push(g.source);
+      return;
     }
+    const parentKey = baseKeys.find(bk => key.startsWith(bk + ' '));
+    if (parentKey) {
+      const parent = byName.get(parentKey);
+      if (!parent.exePath && g.exePath) parent.exePath = g.exePath;
+      if (!parent.sources.includes(g.source)) parent.sources.push(g.source);
+      return;
+    }
+    byName.set(key, { name: g.name, installLocation: g.installLocation, exePath: g.exePath || null, sources: [g.source] });
+    baseKeys.push(key);
   });
   const games = Array.from(byName.entries()).map(([id, g]) => ({
     id,
