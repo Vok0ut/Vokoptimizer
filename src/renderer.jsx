@@ -896,6 +896,60 @@ function RegistryCleaner(){
         </div>}
         <div style={{marginTop:10,fontSize:10,color:'#7e7e7e'}}>SFC y DISM reparan archivos de sistema dañados. Pueden tardar varios minutos y requieren administrador.</div>
       </div>
+
+      <UpdaterPanel/>
+    </div>
+  );
+}
+
+/* ── Actualizaciones de la app ─────── */
+// La app se actualiza sola desde GitHub Releases: comprueba al arrancar,
+// avisa aquí, y aplica el instalador nuevo al reiniciar — sin desinstalar
+// ni volver a instalar a mano.
+function UpdaterPanel(){
+  const [st,setSt]=useState({status:'idle',version:null,error:null,percent:0});
+  const [busy,setBusy]=useState(false);
+  useEffect(()=>{
+    if(!api||!api.updaterGetState)return;
+    api.updaterGetState().then(r=>{if(r&&r.ok)setSt(r.state);}).catch(()=>{});
+    return api.onUpdaterState?api.onUpdaterState(s=>{setSt(s);setBusy(false);}):undefined;
+  },[]);
+  if(!api||!api.updaterGetState)return null;
+
+  const check=async()=>{setBusy(true);const r=await api.updaterCheck();setBusy(false);if(r&&r.ok===false)toast(r.error||'No se pudo comprobar','err');};
+  const download=async()=>{setBusy(true);const r=await api.updaterDownload();if(r&&r.ok===false){setBusy(false);toast(r.error||'No se pudo descargar','err');}};
+  const install=async()=>{const r=await api.updaterInstall();if(r&&r.ok===false)toast(r.error||'No se pudo instalar','err');};
+
+  const S=st.status;
+  const line=
+    S==='dev'?'Modo desarrollo — las actualizaciones solo funcionan en la app instalada.':
+    S==='checking'?'Comprobando si hay una versión nueva…':
+    S==='available'?`Hay una versión nueva disponible: v${st.version}`:
+    S==='downloading'?`Descargando actualización… ${st.percent}%`:
+    S==='downloaded'?`v${st.version} lista para instalar. Se aplicará al reiniciar la app.`:
+    S==='up-to-date'?'Estás en la última versión.':
+    S==='error'?st.error:
+    'Pulsa para comprobar si hay una versión nueva.';
+  const color=S==='error'?'#c98a8a':S==='downloaded'||S==='available'?'#8adfa8':'#9c9c9c';
+
+  return(
+    <div style={{marginTop:28,borderTop:'1.5px solid #262626',paddingTop:20}}>
+      <SLabel>Actualizaciones de Vokoptimizer</SLabel>
+      <div style={{display:'flex',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+        <span style={{fontSize:11,color,flex:'1 1 260px',lineHeight:1.6}}>
+          {(S==='checking'||S==='downloading')&&<span className="spinner" style={{width:9,height:9,marginRight:8,display:'inline-block',verticalAlign:'middle'}}/>}
+          {line}
+        </span>
+        {S==='downloaded'
+          ?<button className="btn-pri" onClick={install} style={{padding:'9px 18px',border:'1.5px solid #8adfa8',background:'transparent',color:'#8adfa8',fontSize:10,letterSpacing:2,textTransform:'uppercase',fontWeight:700}}>Reiniciar e instalar</button>
+          :S==='available'
+          ?<button className="btn-pri" onClick={download} disabled={busy} style={{padding:'9px 18px',border:'1.5px solid #fff',background:'transparent',color:'#fff',fontSize:10,letterSpacing:2,textTransform:'uppercase',fontWeight:700}}>Descargar</button>
+          :<button className="btn-ghost" onClick={check} disabled={busy||S==='dev'||S==='downloading'} style={{padding:'9px 18px',border:'1.5px solid #4a4a4a',background:'transparent',color:(busy||S==='dev')?'#5a5a5a':'#b5b5b5',fontSize:10,letterSpacing:2,textTransform:'uppercase'}}>Buscar actualizaciones</button>}
+      </div>
+      {S==='downloading'&&<div style={{marginTop:10,height:3,background:'#1c1c1c',overflow:'hidden'}}>
+        <div style={{height:'100%',width:`${st.percent}%`,background:'#e5e5e5',transition:'width .3s cubic-bezier(.2,.8,.2,1)'}}/>
+      </div>}
+      <div style={{marginTop:10,fontSize:10,color:'#7e7e7e'}}>La app comprueba actualizaciones sola al arrancar. Al instalar, se conservan tus ajustes e historial.</div>
     </div>
   );
 }
@@ -968,8 +1022,359 @@ function History(){
   );
 }
 
+/* ── Asistente IA (Ollama local) ──── */
+const AI_SUGGEST_MAP=[{view:'services',keys:['servicio','servicios']},{view:'startup',keys:['arranque','inicio de windows','programa de inicio']},{view:'files',keys:['limpiar archivos','archivos temporales','limpieza de disco','papelera']},{view:'registry',keys:['registro de windows','sfc ','dism','reparación del sistema','reparacion del sistema']},{view:'cpu',keys:['liberar memoria','optimizar cpu',' ram ']},{view:'apps',keys:['desinstalar','apps sin usar','programa que no usas']}];
+function suggestActionsFromText(text){
+  const low=' '+(text||'').toLowerCase()+' ';const hits=[];
+  for(const s of AI_SUGGEST_MAP){if(s.keys.some(k=>low.includes(k)))hits.push(s.view);}
+  return [...new Set(hits)];
+}
+const AI_QUICK_NAMES=['resource_usage_now','recent_errors','services_status','driver_issues'];
+const AI_DIAG_LABELS={system_info:'Información del sistema',recent_errors:'Errores recientes',bsod_events:'Pantallazos azules',reliability_history:'Historial de estabilidad',running_processes:'Procesos activos',services_status:'Estado de servicios',disk_health:'Salud del disco',disk_scan_report:'Escaneo del disco (chkdsk)',sfc_verify_only:'Verificación de archivos (sfc)',dism_scan_health:'Verificación de imagen (DISM)',startup_programs:'Programas de arranque',driver_issues:'Problemas de drivers',driver_inventory:'Inventario de drivers',network_status:'Estado de red',network_diagnostics:'Diagnóstico de red',windows_updates:'Actualizaciones instaladas',resource_usage_now:'Uso de recursos ahora',crash_dumps:'Volcados de memoria',group_policy_report:'Políticas de grupo',bitlocker_status:'Estado de BitLocker'};
+function diagLabel(name){return AI_DIAG_LABELS[name]||name;}
+
+// Reconstruye la lista de mensajes a mostrar a partir del historial crudo
+// {role,content,name}[] que persiste main.js. Los mensajes 'tool' se
+// muestran como bloques de diagnóstico, no como texto del asistente.
+function historyToDisplay(history){
+  const out=[];
+  for(const m of history||[]){
+    if(m.role==='user')out.push({kind:'user',text:m.content});
+    else if(m.role==='assistant'){if(m.content&&m.content.trim())out.push({kind:'assistant',text:m.content});}
+    else if(m.role==='tool'){
+      const failed=/^ERROR: /.test(m.content||'');
+      out.push({kind:'diag',name:m.name,status:failed?'error':'ok',output:failed?m.content.replace(/^ERROR: /,''):m.content});
+    }
+  }
+  return out;
+}
+
+function AiSendIcon(){return(<svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M7 12V2M7 2L2.5 6.5M7 2L11.5 6.5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"/></svg>);}
+function AiStopIcon(){return(<svg width="12" height="12" viewBox="0 0 14 14" fill="none" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5" fill="currentColor"/></svg>);}
+function AiCloseGlyph(){return(<svg width="9" height="9" viewBox="0 0 14 14" fill="none" aria-hidden="true"><path d="M2.5 2.5L11.5 11.5M11.5 2.5L2.5 11.5" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round"/></svg>);}
+
+// Tarjeta de confirmación de acción propuesta por el modelo. El modelo
+// NUNCA ejecuta: main.js solo actúa cuando esta tarjeta manda el id.
+function ActionCard({proposal,onResolve}){
+  const [busy,setBusy]=useState(false);
+  const [done,setDone]=useState(null); // {ok,message} | {rejected:true}
+  const danger=proposal.danger==='high';
+  const accent=danger?'#ff9a9a':proposal.danger==='medium'?'#e5c07b':'#8adfa8';
+
+  const confirm=async()=>{
+    if(!api||busy)return;setBusy(true);
+    const r=await api.ollamaConfirmAction(proposal.id);
+    setBusy(false);
+    const res={ok:!!(r&&r.executed),message:(r&&r.message)||'Sin respuesta'};
+    setDone(res);toast(`${proposal.label}: ${res.message}`,res.ok?'ok':'err');
+    onResolve&&onResolve();
+  };
+  const reject=async()=>{
+    if(!api||busy)return;
+    await api.ollamaRejectAction(proposal.id);
+    setDone({rejected:true});onResolve&&onResolve();
+  };
+
+  if(done)return(
+    <div style={{border:'1.5px solid #262626',borderRadius:12,background:'#0a0a0a',padding:'12px 14px',margin:'10px 0',fontSize:11,color:done.rejected?'#8a8a8a':(done.ok?'#8adfa8':'#ff9a9a')}}>
+      {done.rejected?`✗ Acción rechazada: ${proposal.label}`:`${done.ok?'✓':'✗'} ${proposal.label} — ${done.message}`}
+    </div>
+  );
+
+  return(
+    <div style={{border:`1.5px solid ${accent}44`,borderRadius:14,background:'#0b0b0b',padding:'14px 16px',margin:'12px 0',boxShadow:`0 0 0 1px ${accent}11`}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8}}>
+        <span style={{border:`1px solid ${accent}`,color:accent,fontSize:9,lineHeight:'15px',padding:'0 6px',borderRadius:4,letterSpacing:1}}>
+          {danger?'RIESGO ALTO':proposal.danger==='medium'?'MODIFICA EL SISTEMA':'SEGURA'}
+        </span>
+        <span style={{fontSize:12,color:'#fff',fontWeight:700,letterSpacing:.5}}>{proposal.label}</span>
+      </div>
+      {proposal.reason&&<div style={{fontSize:11.5,color:'#b5b5b5',lineHeight:1.65,marginBottom:6}}>{proposal.reason}</div>}
+      <div style={{fontSize:11.5,color:'#e5e5e5',lineHeight:1.65}}>{proposal.summary}</div>
+      <div style={{display:'flex',gap:8,marginTop:14}}>
+        <button onClick={confirm} disabled={busy} className="btn-pri"
+          style={{padding:'8px 16px',border:`1.5px solid ${busy?'#3a3a3a':accent}`,background:'transparent',color:busy?'#5a5a5a':accent,fontSize:10,letterSpacing:2,textTransform:'uppercase',fontWeight:700}}>
+          {busy?'EJECUTANDO…':'Confirmar'}
+        </button>
+        <button onClick={reject} disabled={busy} className="btn-ghost"
+          style={{padding:'8px 16px',border:'1.5px solid #3a3a3a',background:'transparent',color:'#9c9c9c',fontSize:10,letterSpacing:2,textTransform:'uppercase'}}>
+          Rechazar
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DiagBlock({name,status,args,output}){
+  const [open,setOpen]=useState(false);
+  const color=status==='running'?'#9c9c9c':status==='error'?'#ff9a9a':'#8adfa8';
+  const glyph=status==='running'?'…':status==='error'?'✗':'✓';
+  return(
+    <div style={{border:`1.5px solid ${status==='error'?'#4a2a2a':'#2e2e2e'}`,background:'#0a0a0a',margin:'6px 0',fontSize:11}}>
+      <button onClick={()=>setOpen(o=>!o)} disabled={status==='running'} style={{width:'100%',display:'flex',alignItems:'center',gap:8,padding:'8px 12px',background:'transparent',border:'none',color:'#c5c5c5',cursor:status==='running'?'default':'pointer',textAlign:'left'}}>
+        <span style={{color}}>{status==='running'?<span className="spinner" style={{width:9,height:9}}/>:glyph}</span>
+        <span style={{color:'#7a7a7a'}}>&gt; ejecutando:</span>
+        <span style={{color:'#e5e5e5',fontWeight:600}}>{diagLabel(name)}</span>
+        {args&&Object.keys(args).length>0&&<span style={{color:'#6e6e6e'}}>({Object.entries(args).map(([k,v])=>`${k}=${v}`).join(', ')})</span>}
+        {status!=='running'&&<span style={{marginLeft:'auto',color:'#6e6e6e',fontSize:10}}>{open?'ocultar ▲':'ver salida ▼'}</span>}
+      </button>
+      {open&&status!=='running'&&<pre style={{margin:0,padding:'0 12px 12px',color:status==='error'?'#ff9a9a':'#9c9c9c',fontSize:10.5,lineHeight:1.6,whiteSpace:'pre-wrap',maxHeight:280,overflow:'auto'}}>{output}</pre>}
+    </div>
+  );
+}
+
+function AiAssistant({onNavigate}){
+  const [running,setRunning]=useState(null); // null=comprobando, true/false
+  const [models,setModels]=useState([]);
+  const [model,setModel]=useState('');
+  const [history,setHistory]=useState([]);
+  const [liveText,setLiveText]=useState('');
+  const [liveDiags,setLiveDiags]=useState([]); // {name,args,status,output}
+  const [pendingUser,setPendingUser]=useState(null);
+  const [sending,setSending]=useState(false);
+  const [input,setInput]=useState('');
+  const [warnSeen,setWarnSeen]=useState(true);
+  const [loadErr,setLoadErr]=useState(null);
+  const [tab,setTab]=useState('chat'); // 'chat' | 'history'
+  const [conversationId,setConversationId]=useState(null);
+  const [convList,setConvList]=useState([]);
+  const [proposals,setProposals]=useState([]);
+  const scrollRef=useRef(null);
+  const inputRef=useRef(null);
+  const conversationIdRef=useRef(null);
+  useEffect(()=>{conversationIdRef.current=conversationId;},[conversationId]);
+
+  // Textarea que crece con el contenido (40px..140px), sin depender de Tailwind.
+  useEffect(()=>{
+    const el=inputRef.current;if(!el)return;
+    el.style.height='0px';
+    el.style.height=Math.max(40,Math.min(140,el.scrollHeight))+'px';
+  },[input]);
+
+  const refreshConvList=useCallback(async()=>{if(!api)return;try{const r=await api.ollamaListConversations();if(r&&r.ok)setConvList(r.conversations||[]);}catch(e){}},[]);
+  const loadConversation=useCallback(async(id)=>{
+    if(!api||!id)return;
+    try{const r=await api.ollamaGetConversation(id);if(r&&r.ok){setHistory(r.messages||[]);setConversationId(id);}}catch(e){}
+  },[]);
+
+  const init=useCallback(async()=>{
+    if(!api){setRunning(false);return;}
+    setLoadErr(null);
+    try{
+      const [chk,prefs]=await Promise.all([api.ollamaCheck(),api.ollamaGetPrefs()]);
+      setRunning(!!(chk&&chk.running));
+      if(prefs&&prefs.ok)setWarnSeen(!!prefs.prefs.warningShown);
+      if(chk&&chk.running){
+        const lm=await api.ollamaListModels();
+        if(lm&&lm.ok){
+          setModels(lm.models||[]);
+          const saved=prefs&&prefs.prefs&&prefs.prefs.lastModel;
+          const found=(lm.models||[]).find(m=>m.name===saved);
+          setModel(found?found.name:((lm.models||[])[0]?.name||''));
+        }
+        const lastConvId=prefs&&prefs.prefs&&prefs.prefs.lastConversationId;
+        if(lastConvId)await loadConversation(lastConvId);
+        await refreshConvList();
+      }
+    }catch(e){setLoadErr('No se pudo comprobar el estado de Ollama');}
+  },[loadConversation,refreshConvList]);
+
+  useEffect(()=>{init();},[init]);
+
+  useEffect(()=>{
+    if(!api)return;
+    const off1=api.onOllamaChatChunk(c=>{
+      if(c.type==='token')setLiveText(p=>p+c.text);
+      else if(c.type==='error'){toast(c.error,'err');setSending(false);}
+      else if(c.type==='idle'){
+        setSending(false);setLiveText('');setLiveDiags([]);setPendingUser(null);
+        const cid=c.conversationId||conversationIdRef.current;
+        if(cid){loadConversation(cid);api.ollamaSetPrefs({lastConversationId:cid});}
+        refreshConvList();
+      }
+    });
+    const off2=api.onOllamaDiagnosticEvent(ev=>{
+      if(ev.type==='start')setLiveDiags(p=>[...p,{name:ev.name,args:ev.args,status:'running'}]);
+      else if(ev.type==='result')setLiveDiags(p=>p.map(d=>d.name===ev.name&&d.status==='running'?{...d,status:ev.ok?'ok':'error',output:ev.ok?ev.output:ev.error}:d));
+    });
+    const off3=api.onOllamaActionProposal?api.onOllamaActionProposal(p=>setProposals(prev=>[...prev,p])):null;
+    return()=>{off1&&off1();off2&&off2();off3&&off3();};
+  },[loadConversation,refreshConvList]);
+
+  useEffect(()=>{if(scrollRef.current)scrollRef.current.scrollTop=scrollRef.current.scrollHeight;},[history,liveText,liveDiags,pendingUser]);
+
+  const acceptWarning=async()=>{setWarnSeen(true);if(api)await api.ollamaSetPrefs({warningShown:true});};
+
+  const newConversation=()=>{setHistory([]);setConversationId(null);setProposals([]);setTab('chat');if(api)api.ollamaSetPrefs({lastConversationId:null});};
+  const openHistoryItem=async(id)=>{await loadConversation(id);setTab('chat');if(api)api.ollamaSetPrefs({lastConversationId:id});};
+  const clearAllHistory=async()=>{
+    if(!api||convList.length===0)return;
+    const ok=await confirmDialog({
+      title:'Borrar todo el historial',
+      lines:[`Se eliminarán ${convList.length} conversación${convList.length===1?'':'es'} del asistente.`],
+      detail:'Esto no se puede deshacer. No afecta a tu sistema, solo borra las conversaciones guardadas.',
+      danger:true,
+      confirmLabel:'BORRAR TODO',
+    });
+    if(!ok)return;
+    await api.ollamaClearHistory();
+    newConversation();
+    refreshConvList();
+    toast('Historial del asistente borrado','ok');
+  };
+  const deleteConversation=async(id,e)=>{
+    e.stopPropagation();
+    if(!api)return;
+    await api.ollamaDeleteConversation(id);
+    if(id===conversationId)newConversation();
+    refreshConvList();
+  };
+
+  const send=async(text,quick)=>{
+    if(sending||!model)return;
+    if(!warnSeen){toast('Confirma el aviso antes de continuar','info');return;}
+    if(!quick&&(!text||!text.trim()))return;
+    setSending(true);setLiveText('');setLiveDiags([]);
+    setPendingUser(quick?(text||'Diagnóstico completo'):text);
+    if(!quick)setInput('');
+    if(api)await api.ollamaSetPrefs({lastModel:model});
+    const r=api?await api.ollamaChat(text,model,!!quick,conversationId):null;
+    if(r&&r.ok===false){toast(r.error||'No se pudo iniciar la conversación','err');setSending(false);setPendingUser(null);}
+    else if(r&&r.conversationId&&!conversationId)setConversationId(r.conversationId);
+  };
+
+  const cancel=async()=>{if(api)await api.ollamaCancelChat();};
+
+  if(running===null)return<div style={{padding:28}}><Loading label="Comprobando Ollama"/></div>;
+
+  if(running===false)return(
+    <div style={{padding:28,maxWidth:640}}>
+      <SLabel>Asistente IA</SLabel>
+      <ErrorState message="Ollama no está en ejecución en este equipo (127.0.0.1:11434)."/>
+      <div style={{marginTop:16,fontSize:12,color:'#9c9c9c',lineHeight:1.8}}>
+        <div style={{color:'#c5c5c5',marginBottom:8}}>Para usar el asistente:</div>
+        <div>1. Instala Ollama desde <span style={{color:'#e5e5e5'}}>ollama.com</span> si no lo tienes.</div>
+        <div>2. Descarga un modelo, por ejemplo: <span style={{color:'#e5e5e5'}}>ollama pull qwen2.5</span></div>
+        <div>3. Asegúrate de que Ollama esté corriendo (se inicia solo tras instalarlo).</div>
+      </div>
+      <button className="btn-ghost" onClick={init} style={{marginTop:18,padding:'9px 18px',border:'1.5px solid #4a4a4a',background:'transparent',color:'#b5b5b5',fontSize:10,letterSpacing:2,textTransform:'uppercase'}}>REINTENTAR</button>
+    </div>
+  );
+
+  const display=[...historyToDisplay(history)];
+  return(
+    <div style={{padding:'20px 28px',height:'100%',display:'flex',flexDirection:'column',overflow:'hidden'}}>
+      {!warnSeen&&<div style={{border:'1.5px solid #4a4a4a',background:'#0a0a0a',padding:'16px 18px',marginBottom:14,fontSize:11,color:'#c5c5c5',lineHeight:1.7}}>
+        <div style={{color:'#fff',fontWeight:700,letterSpacing:1,marginBottom:6}}>ANTES DE EMPEZAR</div>
+        <div>El asistente lee diagnósticos de solo lectura de tu sistema (procesos, errores, servicios, drivers, red...) y conoce las especificaciones de tu equipo. <span style={{color:'#e5e5e5'}}>Nunca modifica nada por su cuenta:</span> cuando propone una acción correctiva, aparece una tarjeta con lo que va a pasar y solo se ejecuta si pulsas <span style={{color:'#e5e5e5'}}>Confirmar</span>.</div>
+        <button onClick={acceptWarning} className="btn-pri" style={{marginTop:12,padding:'8px 16px',border:'1.5px solid #6a6a6a',background:'transparent',color:'#d8d8d8',fontSize:10,letterSpacing:2,textTransform:'uppercase',fontWeight:700}}>ENTENDIDO</button>
+      </div>}
+
+      <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:14,flexShrink:0,flexWrap:'wrap'}}>
+        <SLabel>Asistente IA · Ollama local</SLabel>
+        <div style={{flex:1}}/>
+        {tab==='chat'&&<select value={model} onChange={e=>setModel(e.target.value)} disabled={sending}>
+          {models.length===0&&<option value="">Sin modelos instalados</option>}
+          {models.map(m=>(<option key={m.name} value={m.name}>{m.name}{m.toolCalling?'':' (sin tool-calling — modo JSON)'}</option>))}
+        </select>}
+        {tab==='chat'&&<button className="btn-ghost" onClick={()=>send(null,true)} disabled={sending||!model} style={{padding:'8px 14px',border:'1.5px solid #4a4a4a',background:'transparent',color:sending?'#5a5a5a':'#b5b5b5',fontSize:10,letterSpacing:1,textTransform:'uppercase'}}>Diagnóstico completo</button>}
+        <button className="btn-ghost" onClick={()=>{const next=tab==='history'?'chat':'history';setTab(next);if(next==='history')refreshConvList();}} disabled={sending}
+          style={{padding:'8px 12px',display:'flex',alignItems:'center',gap:6,border:`1.5px solid ${tab==='history'?'#9c9c9c':'#4a4a4a'}`,background:tab==='history'?'#1c1c1c':'transparent',color:tab==='history'?'#fff':'#b5b5b5',fontSize:10,letterSpacing:1,textTransform:'uppercase'}}>
+          <Icon id="history" size={12}/> Historial{convList.length>0?` (${convList.length})`:''}
+        </button>
+        <button className="btn-ghost" onClick={newConversation} disabled={sending}
+          style={{padding:'8px 12px',border:'1.5px solid #4a4a4a',background:'transparent',color:'#b5b5b5',fontSize:10,letterSpacing:1,textTransform:'uppercase'}}>+ Nueva</button>
+      </div>
+
+      {tab==='chat'&&models.length===0&&<div style={{fontSize:11,color:'#9c9c9c',marginBottom:10}}>No hay modelos instalados. Descarga uno con <span style={{color:'#e5e5e5'}}>ollama pull qwen2.5</span> y pulsa reintentar.</div>}
+
+      {tab==='history'?(
+        <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',border:'1.5px solid #262626',borderRadius:16,background:'#050505'}}>
+          {convList.length>0&&<div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'10px 14px',borderBottom:'1.5px solid #1c1c1c',flexShrink:0}}>
+            <span style={{fontSize:10,color:'#7a7a7a',letterSpacing:1,textTransform:'uppercase'}}>{convList.length} conversación{convList.length===1?'':'es'} guardada{convList.length===1?'':'s'}</span>
+            <button onClick={clearAllHistory} className="btn-ghost"
+              style={{padding:'6px 12px',border:'1.5px solid #4a2a2a',background:'transparent',color:'#c98a8a',fontSize:10,letterSpacing:1,textTransform:'uppercase'}}>Borrar historial</button>
+          </div>}
+          <div style={{flex:1,overflow:'auto',padding:8}}>
+          {convList.length===0&&<div style={{fontSize:11,color:'#6e6e6e',textAlign:'center',padding:'30px 0'}}>Todavía no hay conversaciones guardadas. Empieza una desde la pestaña de chat.</div>}
+          {convList.map(c=>(
+            <div key={c.id} onClick={()=>openHistoryItem(c.id)}
+              style={{display:'flex',alignItems:'center',gap:10,padding:'12px 14px',borderRadius:10,cursor:'pointer',background:c.id===conversationId?'#161616':'transparent',transition:'background .15s'}}
+              onMouseEnter={e=>{if(c.id!==conversationId)e.currentTarget.style.background='#111';}} onMouseLeave={e=>{e.currentTarget.style.background=c.id===conversationId?'#161616':'transparent';}}>
+              <span style={{color:c.id===conversationId?'#fff':'#5a5a5a'}}><Icon id="ai-assistant" size={15}/></span>
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:12,color:'#e5e5e5',fontWeight:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{c.title}</div>
+                <div style={{fontSize:10,color:'#7a7a7a',marginTop:2}}>{fmtDate(c.updatedAt)} · {c.messageCount} mensaje{c.messageCount===1?'':'s'}</div>
+              </div>
+              <button onClick={e=>deleteConversation(c.id,e)} title="Eliminar conversación"
+                style={{flexShrink:0,width:24,height:24,display:'flex',alignItems:'center',justifyContent:'center',border:'none',background:'transparent',color:'#6e6e6e',borderRadius:6,transition:'color .15s,background .15s'}}
+                onMouseEnter={e=>{e.currentTarget.style.color='#ff9a9a';e.currentTarget.style.background='#2a1414';}} onMouseLeave={e=>{e.currentTarget.style.color='#6e6e6e';e.currentTarget.style.background='transparent';}}>
+                <AiCloseGlyph/>
+              </button>
+            </div>
+          ))}
+          </div>
+        </div>
+      ):(
+        <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',border:'1.5px solid #2c2c2c',borderRadius:16,background:'#050505',boxShadow:'0 8px 32px rgba(0,0,0,.35)'}}>
+          <div ref={scrollRef} style={{flex:1,overflow:'auto',padding:'16px 18px'}}>
+            {display.length===0&&!pendingUser&&<div style={{fontSize:11,color:'#6e6e6e',textAlign:'center',padding:'30px 0'}}>Escribe algo o pulsa "Diagnóstico completo" para empezar.</div>}
+            {display.map((m,i)=>m.kind==='diag'
+              ?<DiagBlock key={i} name={m.name} status={m.status} output={m.output}/>
+              :<div key={i} style={{margin:'10px 0'}}>
+                <div style={{fontSize:10,letterSpacing:1,color:m.kind==='user'?'#8a8a8a':'#7a9cff',marginBottom:3,textTransform:'uppercase'}}>{m.kind==='user'?'> tú':'> asistente'}</div>
+                <div style={{fontSize:12.5,color:'#e5e5e5',lineHeight:1.7,whiteSpace:'pre-wrap'}}>{m.text}</div>
+                {m.kind==='assistant'&&suggestActionsFromText(m.text).map(v=>(
+                  <button key={v} onClick={()=>onNavigate&&onNavigate(v)} className="btn-ghost" style={{marginTop:6,marginRight:6,padding:'6px 12px',border:'1.5px solid #3a3a3a',background:'transparent',color:'#9cb8ff',fontSize:10,letterSpacing:1,textTransform:'uppercase'}}>Abrir {PAGE_TITLES[v]||v} →</button>
+                ))}
+              </div>
+            )}
+            {pendingUser&&<div style={{margin:'10px 0'}}>
+              <div style={{fontSize:10,letterSpacing:1,color:'#8a8a8a',marginBottom:3,textTransform:'uppercase'}}>&gt; tú</div>
+              <div style={{fontSize:12.5,color:'#e5e5e5',lineHeight:1.7,whiteSpace:'pre-wrap'}}>{pendingUser}</div>
+            </div>}
+            {liveDiags.map((d,i)=>(<DiagBlock key={'live'+i} name={d.name} args={d.args} status={d.status} output={d.output}/>))}
+            {sending&&<div style={{margin:'10px 0'}}>
+              <div style={{fontSize:10,letterSpacing:1,color:'#7a9cff',marginBottom:3,textTransform:'uppercase'}}>&gt; asistente</div>
+              <div style={{fontSize:12.5,color:'#e5e5e5',lineHeight:1.7,whiteSpace:'pre-wrap'}}>{liveText}{<span className="blink">_</span>}</div>
+            </div>}
+            {proposals.map(p=>(<ActionCard key={p.id} proposal={p}/>))}
+          </div>
+
+          <div style={{display:'flex',alignItems:'flex-end',gap:10,flexShrink:0,borderTop:'1.5px solid #212121',padding:'10px 10px 10px 18px',background:'#070707',transition:'box-shadow .2s'}}
+            onFocus={e=>e.currentTarget.style.boxShadow='inset 0 1px 0 #3a3a3a'} onBlur={e=>e.currentTarget.style.boxShadow='none'}>
+            <textarea ref={inputRef} value={input} rows={1}
+              onChange={e=>setInput(e.target.value)}
+              onKeyDown={e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send(input,false);}}}
+              placeholder="Pregunta algo sobre tu sistema… (Shift+Enter = salto de línea)" disabled={sending||!model}
+              style={{flex:1,background:'transparent',border:'none',color:'#e5e5e5',fontFamily:'var(--mono)',fontSize:12,lineHeight:1.6,padding:'9px 0',outline:'none',resize:'none',overflowY:'auto',maxHeight:140}}/>
+            <button
+              type="button"
+              onClick={sending?cancel:()=>send(input,false)}
+              disabled={!sending&&(!input.trim()||!model)}
+              aria-label={sending?'Detener generación':'Enviar mensaje'}
+              style={{
+                flexShrink:0,width:32,height:32,marginBottom:4,borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',
+                border:'1.5px solid transparent',cursor:sending||input.trim()?'pointer':'default',
+                background:sending?'transparent':(input.trim()?'#fff':'#1c1c1c'),
+                borderColor:sending?'#6a3a3a':'transparent',
+                color:sending?'#ff9a9a':(input.trim()?'#000':'#5a5a5a'),
+                transition:'background .2s cubic-bezier(.2,.8,.2,1),color .2s,border-color .2s,transform .15s',
+              }}
+              onMouseDown={e=>{if(sending||input.trim())e.currentTarget.style.transform='scale(.9)';}}
+              onMouseUp={e=>{e.currentTarget.style.transform='scale(1)';}}
+            >
+              {sending?<AiStopIcon/>:<AiSendIcon/>}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Orbital Menu ──────────────────── */
-const TOOLS=[{id:'dashboard',label:'Dashboard',sub:'Estado general'},{id:'files',label:'Limpiar archivos',sub:'Escaneo real de disco'},{id:'apps',label:'Apps y restos',sub:'Software arrastrado'},{id:'services',label:'Servicios',sub:'Servicios del sistema'},{id:'startup',label:'Arranque',sub:'Programas de inicio'},{id:'cpu',label:'CPU / RAM',sub:'Optimización memoria'},{id:'games',label:'Perfiles de juego',sub:'Optimización por título'},{id:'registry',label:'Mantenimiento',sub:'Registro y reparación'},{id:'monitor',label:'Monitoreo',sub:'Tiempo real'},{id:'history',label:'Historial',sub:'Operaciones'}];
+const TOOLS=[{id:'dashboard',label:'Dashboard',sub:'Estado general'},{id:'files',label:'Limpiar archivos',sub:'Escaneo real de disco'},{id:'apps',label:'Apps y restos',sub:'Software arrastrado'},{id:'services',label:'Servicios',sub:'Servicios del sistema'},{id:'startup',label:'Arranque',sub:'Programas de inicio'},{id:'cpu',label:'CPU / RAM',sub:'Optimización memoria'},{id:'games',label:'Perfiles de juego',sub:'Optimización por título'},{id:'registry',label:'Mantenimiento',sub:'Registro y reparación'},{id:'monitor',label:'Monitoreo',sub:'Tiempo real'},{id:'history',label:'Historial',sub:'Operaciones'},{id:'ai-assistant',label:'Asistente IA',sub:'Diagnóstico con IA local'}];
 
 // Monochrome stroke icons (SVG) — consistent rendering, no emoji fallback
 function Icon({id,size=20}){
@@ -986,6 +1391,7 @@ function Icon({id,size=20}){
     case 'registry':return(<svg style={s} viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h16" {...p}/><circle cx="9.5" cy="6.5" r="1.8" {...p}/><circle cx="15" cy="12" r="1.8" {...p}/><circle cx="7.5" cy="17.5" r="1.8" {...p}/></svg>);
     case 'monitor':return(<svg style={s} viewBox="0 0 24 24"><path d="M2.5 13 h4.5 l2.5 -7 4 12 2.5 -7 h5.5" {...p}/></svg>);
     case 'history':return(<svg style={s} viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" {...p}/><path d="M12 7.5 v4.5 l3.5 2" {...p}/></svg>);
+    case 'ai-assistant':return(<svg style={s} viewBox="0 0 24 24"><rect x="4" y="5.5" width="16" height="12" rx="1.5" {...p}/><path d="M9 20 l3 -2.5 l3 2.5" {...p}/><circle cx="9" cy="11.5" r="1" fill="currentColor" stroke="none"/><circle cx="15" cy="11.5" r="1" fill="currentColor" stroke="none"/><path d="M12 5.5 v-2" {...p}/></svg>);
     default:return null;
   }
 }
@@ -1095,7 +1501,7 @@ function TitleBar(){
   );
 }
 
-const PAGE_TITLES={dashboard:'Panel de control',files:'Limpiador de archivos',apps:'Apps y restos',services:'Gestor de servicios',startup:'Gestor de arranque',cpu:'Optimización CPU / RAM',games:'Perfiles de juego',registry:'Mantenimiento del sistema',monitor:'Monitoreo de recursos',history:'Historial de optimizaciones'};
+const PAGE_TITLES={dashboard:'Panel de control',files:'Limpiador de archivos',apps:'Apps y restos',services:'Gestor de servicios',startup:'Gestor de arranque',cpu:'Optimización CPU / RAM',games:'Perfiles de juego',registry:'Mantenimiento del sistema',monitor:'Monitoreo de recursos',history:'Historial de optimizaciones','ai-assistant':'Asistente IA'};
 
 /* ── App ───────────────────────────── */
 function App(){
@@ -1137,6 +1543,7 @@ function App(){
             {view==='registry'&&<RegistryCleaner/>}
             {view==='monitor'&&<MonitorPanel metrics={metrics}/>}
             {view==='history'&&<History/>}
+            {view==='ai-assistant'&&<AiAssistant onNavigate={setView}/>}
           </div>
         </div>
       )}

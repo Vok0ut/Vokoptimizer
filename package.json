@@ -11,7 +11,8 @@
     "start": "node esbuild.config.js && electron .",
     "build": "node esbuild.config.js && electron-builder --win",
     "build-portable": "node esbuild.config.js && electron-builder --win portable",
-    "build-installer": "node esbuild.config.js && electron-builder --win nsis"
+    "build-installer": "node esbuild.config.js && electron-builder --win nsis",
+    "release": "node esbuild.config.js && electron-builder --win nsis --publish always"
   },
   "devDependencies": {
     "electron": "^28.3.3",
@@ -29,15 +30,33 @@
     "files": [
       "main.js",
       "preload.js",
+      "ollama-diagnostics.js",
       "src/index.html",
       "src/app.bundle.js",
       "src/fonts/**/*",
       "icon.ico"
     ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Vok0ut",
+        "repo": "Vokoptimizer"
+      }
+    ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "portable", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "icon.ico",
       "requestedExecutionLevel": "requireAdministrator"
@@ -60,6 +79,7 @@
     }
   },
   "dependencies": {
+    "electron-updater": "^6.8.9",
     "systeminformation": "^5.31.7"
   }
 }

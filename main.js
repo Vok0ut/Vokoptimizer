@@ -383,7 +383,7 @@ $out | ConvertTo-Json -Compress`;
   };
 });
 
-ipcMain.handle('clean-junk', async (e, selectedIds) => {
+async function cleanJunkCategories(selectedIds) {
   if (!IS_WIN) return { ok: false, freed: 0 };
   const t0 = Date.now();
   const ids = (selectedIds || []).filter(id => JUNK_CATS.some(c => c.id === id));
@@ -428,7 +428,8 @@ Write-Output $freed`;
   const freed = parseInt((r.stdout || '0').trim()) || 0;
   addHistory('Limpieza de archivos', `${ids.length} categorías`, { freed, durationMs: Date.now() - t0 });
   return { ok: true, freed };
-});
+}
+ipcMain.handle('clean-junk', async (e, selectedIds) => cleanJunkCategories(selectedIds));
 
 /* ═══════════════════════════════════════════════════════════════════
    SERVICES — real list + start/stop + startup type
@@ -480,7 +481,7 @@ Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $na
   };
 });
 
-ipcMain.handle('set-service', async (e, name, action) => {
+async function setServiceState(name, action) {
   if (!IS_WIN) return { ok: false };
   if (!SVC_META[name]) return { ok: false, error: 'Servicio no permitido' };
   let cmd = '';
@@ -494,7 +495,8 @@ ipcMain.handle('set-service', async (e, name, action) => {
   if (/^OK/.test(r.stdout)) { addHistory('Servicio', `${name} → ${action}`); return { ok: true }; }
   const msg = (r.stdout || r.stderr || '').replace(/^ERR:/, '');
   return { ok: false, error: msg || (isAdmin ? 'Falló la operación' : 'Requiere administrador') };
-});
+}
+ipcMain.handle('set-service', async (e, name, action) => setServiceState(name, action));
 
 /* ═══════════════════════════════════════════════════════════════════
    STARTUP MANAGER — real list + reversible enable/disable (StartupApproved)
@@ -571,7 +573,7 @@ async function memAvailable() {
   try { const m = await si.mem(); return m.available; } catch (e) { return os.freemem(); }
 }
 
-ipcMain.handle('free-ram', async () => {
+async function doFreeRam() {
   if (!IS_WIN) return { ok: false, freed: 0 };
   const before = await memAvailable();
   const script = `
@@ -601,7 +603,8 @@ Write-Output $n`;
   const freed = Math.max(0, after - before);
   addHistory('Liberar RAM', `${parseInt(r.stdout) || 0} procesos`, { freed });
   return { ok: true, freed, procs: parseInt(r.stdout) || 0 };
-});
+}
+ipcMain.handle('free-ram', async () => doFreeRam());
 
 // Procesos cuya terminación puede colgar o cerrar la sesión de Windows.
 // Comparación por nombre de imagen (minúsculas, sin .exe).
@@ -613,7 +616,7 @@ const PROTECTED_PROCESSES = new Set([
   'audiodg', 'spoolsv', 'wudfhost', 'memcompression',
 ]);
 
-ipcMain.handle('kill-process', async (e, pid) => {
+async function killProcessByPid(pid) {
   if (!IS_WIN || !pid) return { ok: false };
   const pidNum = parseInt(pid);
   if (!Number.isFinite(pidNum) || pidNum <= 0) return { ok: false, error: 'PID inválido' };
@@ -631,7 +634,8 @@ try {
   }
   const kr = await ps(`try { Stop-Process -Id ${pidNum} -Force -ErrorAction Stop; Write-Output 'OK' } catch { Write-Output ('ERR:' + $_.Exception.Message) }`, { timeout: 8000 });
   return /^OK/.test(kr.stdout) ? { ok: true } : { ok: false, error: (kr.stdout || '').replace(/^ERR:/, '') };
-});
+}
+ipcMain.handle('kill-process', async (e, pid) => killProcessByPid(pid));
 
 /* ═══════════════════════════════════════════════════════════════════
    POWER PROFILES / GAME / QUIET MODE
@@ -782,12 +786,13 @@ ipcMain.handle('set-quiet-mode', async (e, enable) => applyProfile(enable ? 'tra
 /* ═══════════════════════════════════════════════════════════════════
    NETWORK
    ═══════════════════════════════════════════════════════════════════ */
-ipcMain.handle('flush-dns', async () => {
+async function doFlushDns() {
   if (!IS_WIN) return { ok: false };
   const ok = await execAsync('ipconfig /flushdns');
   addHistory('Red', 'Caché DNS vaciada');
   return { ok };
-});
+}
+ipcMain.handle('flush-dns', async () => doFlushDns());
 
 ipcMain.handle('network-reset', async () => {
   if (!IS_WIN) return { ok: false };
@@ -947,7 +952,7 @@ foreach ($it in $items) {
 /* ═══════════════════════════════════════════════════════════════════
    SYSTEM RESTORE POINT + DEEP REPAIR (SFC / DISM) with streamed log
    ═══════════════════════════════════════════════════════════════════ */
-ipcMain.handle('create-restore-point', async () => {
+async function doCreateRestorePoint() {
   if (!IS_WIN) return { ok: false };
   const r = await ps(`
 try {
@@ -961,7 +966,8 @@ try {
   const ok = /^OK/.test(r.stdout);
   if (ok) addHistory('Punto de restauración', 'creado');
   return { ok, error: ok ? null : ((r.stdout || '').replace(/^ERR:/, '') || (isAdmin ? 'Protección del sistema desactivada' : 'Requiere administrador')) };
-});
+}
+ipcMain.handle('create-restore-point', async () => doCreateRestorePoint());
 
 let healthRunning = false;
 let healthChild = null;
@@ -1919,6 +1925,682 @@ ipcMain.handle('get-active-game-profile', async () => {
 });
 
 /* ═══════════════════════════════════════════════════════════════════
+   ASISTENTE IA (Ollama local) — módulo de diagnóstico de solo lectura
+   ═══════════════════════════════════════════════════════════════════
+   Diseño (confirmado con el usuario antes de implementar):
+   - Catálogo cerrado en ollama-diagnostics.js. El modelo SOLO puede pedir
+     nombres de ese catálogo — nunca un comando libre. Ver runDiagnostic().
+   - Detección de tool-calling: lista blanca de familias de modelo conocidas
+     (instantánea, no bloqueante) con fallback automático al camino
+     JSON-en-system-prompt para cualquier modelo no listado — nunca se deja
+     un modelo sin poder pedir diagnósticos.
+   - Anti-bucle: máximo MAX_TOOL_HOPS turnos modelo↔diagnóstico; al llegar al
+     límite se fuerza una última llamada sin `tools` para que el modelo
+     concluya con lo que ya tiene. Además, la misma llamada (nombre+args)
+     repetida más de 2 veces se rechaza explícitamente en el siguiente turno
+     en vez de volver a ejecutarse.
+   - Camino JSON (modelos sin tool-calling nativo): el texto del modelo NO
+     se transmite en vivo token a token — se acumula completo y solo se
+     manda a la UI si NO es un bloque {"tool":...}. Así nunca se le enseña
+     al usuario un JSON crudo de petición de herramienta como si fuera la
+     respuesta del asistente.
+   ═══════════════════════════════════════════════════════════════════ */
+const { DIAGNOSTICS, ACTIONS } = require('./ollama-diagnostics');
+const OLLAMA_BASE = 'http://127.0.0.1:11434';
+const MAX_TOOL_HOPS = 7;
+const AI_CONVERSATIONS_FILE = path.join(app.getPath('userData'), 'vok-ai-conversations.json');
+const AI_PREFS_FILE = path.join(app.getPath('userData'), 'vok-ai-prefs.json');
+
+// Familias de modelo con tool-calling nativo conocido en Ollama. Substring
+// match, no exacto, para cubrir tags de cuantización (p.ej. "qwen2.5:14b").
+// No exhaustivo a propósito: lo que no está aquí cae al camino JSON, que
+// funciona con cualquier modelo — nunca es un fallo duro.
+const TOOL_CALLING_HINTS = [
+  'llama3.1', 'llama3.2', 'llama3.3', 'llama-3.1', 'llama-3.2', 'llama-3.3',
+  'qwen2.5', 'qwen2', 'qwen3', 'mistral-nemo', 'mistral-small', 'mixtral',
+  'firefunction', 'command-r', 'hermes3', 'nemotron', 'granite3', 'gpt-oss',
+];
+function supportsToolCalling(modelName) {
+  const n = (modelName || '').toLowerCase();
+  return TOOL_CALLING_HINTS.some(h => n.includes(h));
+}
+
+function loadConversations() { try { return JSON.parse(fs.readFileSync(AI_CONVERSATIONS_FILE, 'utf8')); } catch (e) { return []; } }
+function saveConversations(list) {
+  try { fs.writeFileSync(AI_CONVERSATIONS_FILE, JSON.stringify(list.slice(-50))); } catch (e) {}
+}
+function conversationTitleFrom(text) {
+  const t = (text || '').trim().replace(/\s+/g, ' ');
+  return t.length > 48 ? t.slice(0, 48) + '…' : (t || 'Conversación');
+}
+function loadAiPrefs() { try { return JSON.parse(fs.readFileSync(AI_PREFS_FILE, 'utf8')); } catch (e) { return {}; } }
+function saveAiPrefs(patch) { try { fs.writeFileSync(AI_PREFS_FILE, JSON.stringify({ ...loadAiPrefs(), ...patch })); } catch (e) {} }
+
+function sendSafe(channel, payload) { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, payload); }
+
+function execCliSafe(cmd, args, timeout = 5000) {
+  return new Promise(resolve => {
+    execFile(cmd, args, { timeout, windowsHide: true }, (err, stdout, stderr) => {
+      resolve({ ok: !err, stdout: (stdout || '').trim(), stderr: (stderr || '').trim(), err });
+    });
+  });
+}
+
+async function ollamaFetch(pathPart, opts = {}) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), opts.timeout || 3000);
+  try {
+    const res = await fetch(OLLAMA_BASE + pathPart, { ...opts, signal: ctrl.signal });
+    return res;
+  } finally { clearTimeout(t); }
+}
+
+ipcMain.handle('ollama-check', async () => {
+  try {
+    const res = await ollamaFetch('/api/tags', { timeout: 2500 });
+    if (res.ok) return { ok: true, running: true };
+  } catch (e) {}
+  // Respaldo: el daemon puede estar vivo con la API HTTP fallando por algo
+  // puntual (puerto en conflicto, firewall...). `ollama list` no depende de
+  // la API HTTP porque habla con el servicio por su propio canal.
+  const r = await execCliSafe('ollama', ['list'], 4000);
+  if (r.ok) return { ok: true, running: true, viaCli: true };
+  return { ok: true, running: false };
+});
+
+function parseOllamaListText(stdout) {
+  const lines = stdout.split('\n').slice(1).map(l => l.trim()).filter(Boolean);
+  return lines.map(l => {
+    const name = l.split(/\s{2,}/)[0] || l;
+    return { name, sizeBytes: null, paramSize: null, family: null, quant: null, toolCalling: supportsToolCalling(name) };
+  });
+}
+
+ipcMain.handle('ollama-list-models', async () => {
+  try {
+    const res = await ollamaFetch('/api/tags', { timeout: 4000 });
+    if (!res.ok) throw new Error('bad status ' + res.status);
+    const data = await res.json();
+    const models = (data.models || []).map(m => ({
+      name: m.name,
+      sizeBytes: m.size || 0,
+      paramSize: (m.details && m.details.parameter_size) || null,
+      family: (m.details && m.details.family) || null,
+      quant: (m.details && m.details.quantization_level) || null,
+      toolCalling: supportsToolCalling(m.name),
+    }));
+    return { ok: true, running: true, models };
+  } catch (e) {
+    const r = await execCliSafe('ollama', ['list'], 5000);
+    if (!r.ok) return { ok: false, running: false, error: 'No se pudo conectar con Ollama en 127.0.0.1:11434', models: [] };
+    return { ok: true, running: true, models: parseOllamaListText(r.stdout), viaCli: true };
+  }
+});
+
+ipcMain.handle('ollama-get-prefs', async () => ({ ok: true, prefs: loadAiPrefs() }));
+ipcMain.handle('ollama-set-prefs', async (e, patch) => { saveAiPrefs(patch || {}); return { ok: true }; });
+
+ipcMain.handle('ollama-list-conversations', async () => {
+  const list = loadConversations()
+    .map(c => ({ id: c.id, title: c.title || 'Conversación', updatedAt: c.updatedAt, messageCount: (c.messages || []).filter(m => m.role === 'user' || m.role === 'assistant').length }))
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  return { ok: true, conversations: list };
+});
+ipcMain.handle('ollama-get-conversation', async (e, id) => {
+  const conv = loadConversations().find(c => c.id === id);
+  return conv ? { ok: true, messages: conv.messages, title: conv.title } : { ok: false, error: 'Conversación no encontrada' };
+});
+ipcMain.handle('ollama-delete-conversation', async (e, id) => {
+  saveConversations(loadConversations().filter(c => c.id !== id));
+  return { ok: true };
+});
+ipcMain.handle('ollama-clear-history', async () => { saveConversations([]); return { ok: true }; });
+
+// Valida params del modelo contra el esquema del catálogo — nunca se
+// interpola nada del modelo directamente en un script sin pasar por aquí.
+function validateDiagnosticParams(name, rawParams) {
+  const entry = DIAGNOSTICS[name];
+  const schema = (entry && entry.params) || {};
+  const params = {};
+  for (const [key, def] of Object.entries(schema)) {
+    const raw = rawParams && rawParams[key] != null ? rawParams[key] : def.default;
+    if (def.type === 'int') {
+      const n = parseInt(raw, 10);
+      params[key] = Number.isFinite(n) ? Math.max(def.min, Math.min(def.max, n)) : def.default;
+    } else if (def.type === 'letter') {
+      const s = String(raw || def.default).trim().toUpperCase();
+      params[key] = /^[A-Z]$/.test(s) ? s : def.default;
+    } else {
+      params[key] = def.default;
+    }
+  }
+  return params;
+}
+
+async function runDiagnostic(name, rawParams) {
+  const entry = DIAGNOSTICS[name];
+  if (!entry) return { ok: false, error: `"${name}" no está en el catálogo de diagnósticos permitidos. Catálogo disponible: ${Object.keys(DIAGNOSTICS).join(', ')}.` };
+  if (entry.special === 'metrics') {
+    try { const m = await getMetricsOnce(); return { ok: true, output: JSON.stringify(m) }; }
+    catch (e) { return { ok: false, error: 'No se pudo leer el estado de recursos actual' }; }
+  }
+  const params = validateDiagnosticParams(name, rawParams);
+  const script = entry.script(params);
+  const r = await ps(script, { timeout: entry.timeout || 25000 });
+  if (r.err) {
+    const timedOut = r.err.killed || /ETIMEDOUT/i.test(String(r.err.message || ''));
+    return { ok: false, error: timedOut ? `El diagnóstico "${name}" tardó demasiado y se canceló.` : (r.stderr || r.err.message || 'Falló la ejecución del diagnóstico') };
+  }
+  let output = r.stdout || '(sin salida — no se encontró nada relevante)';
+  const max = entry.maxOutputChars || 6000;
+  if (output.length > max) output = output.slice(0, max) + `\n… [truncado — ${output.length - max} caracteres omitidos]`;
+  return { ok: true, output };
+}
+
+const ACTIONS_LIST = Object.keys(ACTIONS).join(', ');
+const AI_SYSTEM_PROMPT = `Eres el asistente de diagnóstico integrado en Vokoptimizer, una app de optimización de Windows. Ayudas al usuario a entender y resolver problemas de su sistema.
+
+REGLAS DURAS:
+- Solo puedes pedir información ejecutando diagnósticos del catálogo cerrado que se te da. NUNCA pidas un comando libre ni un diagnóstico que no esté en la lista.
+- Todos los diagnósticos son de solo lectura — no modifican nada del sistema.
+- Para acciones que SÍ modifican el sistema tienes herramientas propias (${ACTIONS_LIST}). Llamarlas NO las ejecuta: solo muestra al usuario una tarjeta de confirmación y él decide. Nunca des una acción por ejecutada hasta que te llegue su resultado.
+- Si la acción que hace falta no está en esa lista, explícasela al usuario y dile qué módulo de Vokoptimizer abrir.
+- Ya tienes las especificaciones del equipo más abajo: NO se las preguntes al usuario.
+- No pidas dos veces el mismo diagnóstico con los mismos parámetros salvo que el usuario te lo pida explícitamente.
+- Responde siempre en español, tono directo y cercano, sin relleno.`;
+
+// Specs del equipo cacheadas y embebidas en el system prompt: el modelo
+// preguntaba "¿qué CPU/GPU tienes?" en cada conversación, cuando el dato
+// ya está disponible localmente.
+let cachedSpecs = null;
+async function getSystemSpecs() {
+  if (cachedSpecs) return cachedSpecs;
+  try {
+    const [cpu, mem, osInfo, graphics, disks, system] = await Promise.all([
+      si.cpu().catch(() => ({})), si.mem().catch(() => ({})), si.osInfo().catch(() => ({})),
+      si.graphics().catch(() => ({ controllers: [] })), si.diskLayout().catch(() => []), si.system().catch(() => ({})),
+    ]);
+    const gpus = (graphics.controllers || []).map(g => `${g.model || '?'}${g.vram ? ` (${g.vram} MB)` : ''}`).join(', ');
+    const drives = (disks || []).map(d => `${d.name || d.type || 'disco'} ${Math.round((d.size || 0) / 1e9)} GB${d.type ? ` (${d.type})` : ''}`).join(', ');
+    cachedSpecs = [
+      `Equipo: ${[system.manufacturer, system.model].filter(Boolean).join(' ') || 'desconocido'}`,
+      `SO: ${osInfo.distro || 'Windows'} ${osInfo.release || ''} build ${osInfo.build || '?'} (${osInfo.arch || ''})`,
+      `CPU: ${[cpu.manufacturer, cpu.brand].filter(Boolean).join(' ') || '?'} — ${cpu.physicalCores || '?'} núcleos / ${cpu.cores || '?'} hilos @ ${cpu.speed || '?'} GHz`,
+      `RAM total: ${mem.total ? (mem.total / 1073741824).toFixed(1) + ' GB' : '?'}`,
+      `GPU: ${gpus || '?'}`,
+      `Discos: ${drives || '?'}`,
+    ].join('\n');
+  } catch (e) { cachedSpecs = 'No se pudieron leer las especificaciones del equipo.'; }
+  return cachedSpecs;
+}
+
+function buildToolsSchema() {
+  const diagTools = Object.entries(DIAGNOSTICS).map(([name, d]) => ({
+    type: 'function',
+    function: {
+      name,
+      description: d.description,
+      parameters: {
+        type: 'object',
+        properties: Object.fromEntries(Object.entries(d.params || {}).map(([k, def]) => [k, { type: def.type === 'int' ? 'integer' : 'string', description: def.hint || '' }])),
+        required: [],
+      },
+    },
+  }));
+  // Cada acción se registra como herramienta con SU PROPIO nombre.
+  // Motivo (medido, no supuesto): con una única herramienta genérica
+  // `propose_action` conviviendo con los diagnósticos, el modelo imitaba el
+  // patrón de estos e inventaba una herramienta inexistente (`flush_dns`),
+  // que Ollama descartaba por no estar en el esquema y devolvía una respuesta
+  // VACÍA. Registrando los nombres reales, la llamada es válida. Que se llamen
+  // igual que la acción no implica ejecución: main.js siempre las convierte en
+  // propuesta pendiente de confirmación del usuario.
+  for (const [name, a] of Object.entries(ACTIONS)) {
+    diagTools.push({
+      type: 'function',
+      function: {
+        name,
+        description: `${a.description} IMPORTANTE: esto NO ejecuta la acción — muestra al usuario una tarjeta de confirmación y él decide. No la des por hecha.`,
+        parameters: {
+          type: 'object',
+          properties: {
+            ...Object.fromEntries(Object.entries(a.params || {}).map(([k, def]) => [
+              k,
+              def.type === 'int' ? { type: 'integer', description: def.hint || '' }
+                : def.type === 'stringArray' ? { type: 'array', items: { type: 'string' }, description: def.hint || '' }
+                : { type: 'string', description: def.hint || '' },
+            ])),
+            reason: { type: 'string', description: 'Por qué recomiendas esta acción, en una frase para el usuario' },
+          },
+          required: [],
+        },
+      },
+    });
+  }
+  return diagTools;
+}
+
+function validateActionParams(name, rawParams) {
+  const schema = (ACTIONS[name] && ACTIONS[name].params) || {};
+  const params = {};
+  for (const [key, def] of Object.entries(schema)) {
+    const raw = rawParams && rawParams[key] != null ? rawParams[key] : def.default;
+    if (def.type === 'int') {
+      const n = parseInt(raw, 10);
+      params[key] = Number.isFinite(n) ? Math.max(def.min, Math.min(def.max, n)) : def.default;
+    } else if (def.type === 'stringArray') {
+      const arr = Array.isArray(raw) ? raw : [raw];
+      const clean = arr.filter(v => def.allowed.includes(v));
+      params[key] = clean.length ? clean : def.default;
+    } else {
+      params[key] = String(raw == null ? def.default : raw).slice(0, 200);
+    }
+  }
+  return params;
+}
+
+// Propuestas pendientes de confirmación. Una acción SOLO puede ejecutarse
+// si su id sigue aquí — y el id se entrega al renderer, nunca al modelo.
+const pendingActions = new Map();
+
+function proposeAction(rawName, rawParams, reason) {
+  const name = String(rawName || '');
+  const entry = ACTIONS[name];
+  if (!entry) return { ok: false, error: `"${name}" no es una acción permitida. Disponibles: ${Object.keys(ACTIONS).join(', ')}.` };
+  const params = validateActionParams(name, rawParams);
+  const id = crypto.randomUUID();
+  const proposal = { id, action: name, params, label: entry.label, danger: entry.danger, summary: entry.summarize(params), reason: String(reason || '').slice(0, 300), createdAt: Date.now() };
+  pendingActions.set(id, proposal);
+  sendSafe('ollama-action-proposal', proposal);
+  return { ok: true, proposal };
+}
+
+async function executeConfirmedAction(id) {
+  const p = pendingActions.get(id);
+  if (!p) return { ok: false, error: 'Esta propuesta ya no es válida (caducada o ya resuelta)' };
+  pendingActions.delete(id);
+  const { action, params } = p;
+  try {
+    if (action === 'clean_temp_files') {
+      const r = await cleanJunkCategories(params.categories);
+      return { ok: !!r.ok, message: r.ok ? `Liberados ${(r.freed / 1048576).toFixed(0)} MB` : (r.error || 'Falló la limpieza') };
+    }
+    if (action === 'stop_service' || action === 'start_service') {
+      const r = await setServiceState(params.name, action === 'stop_service' ? 'stop' : 'start');
+      return { ok: !!r.ok, message: r.ok ? `Servicio "${params.name}" ${action === 'stop_service' ? 'detenido' : 'iniciado'}` : (r.error || 'Falló la operación') };
+    }
+    if (action === 'kill_process') {
+      const r = await killProcessByPid(params.pid);
+      return { ok: !!r.ok, message: r.ok ? `Proceso ${params.pid} cerrado` : (r.error || 'No se pudo cerrar el proceso') };
+    }
+    if (action === 'flush_dns') { const r = await doFlushDns(); return { ok: !!r.ok, message: r.ok ? 'Caché DNS vaciada' : (r.error || 'Falló') }; }
+    if (action === 'free_ram') { const r = await doFreeRam(); return { ok: !!r.ok, message: r.ok ? `Memoria liberada${r.freed ? `: ${(r.freed / 1048576).toFixed(0)} MB` : ''}` : (r.error || 'Falló') }; }
+    if (action === 'create_restore_point') { const r = await doCreateRestorePoint(); return { ok: !!r.ok, message: r.ok ? 'Punto de restauración creado' : (r.error || 'Falló') }; }
+    return { ok: false, error: 'Acción no implementada' };
+  } catch (err) {
+    return { ok: false, error: err.message || 'Error ejecutando la acción' };
+  }
+}
+
+ipcMain.handle('ollama-confirm-action', async (e, id) => {
+  const p = pendingActions.get(id);
+  if (!p) return { ok: false, error: 'Propuesta no válida' };
+  const result = await executeConfirmedAction(id);
+  addHistory('Acción IA', `${p.label} — ${result.ok ? 'OK' : 'falló'}`, { status: result.ok ? 'OK' : 'WARN' });
+  return { ok: true, executed: result.ok, message: result.message || result.error, action: p.action, label: p.label };
+});
+
+ipcMain.handle('ollama-reject-action', async (e, id) => { pendingActions.delete(id); return { ok: true }; });
+
+function buildJsonModeSuffix() {
+  const lines = Object.entries(DIAGNOSTICS).map(([name, d]) => `- ${name}: ${d.description}${d.params ? ` (parámetros opcionales: ${Object.keys(d.params).join(', ')})` : ''}`);
+  for (const [name, a] of Object.entries(ACTIONS)) {
+    lines.push(`- ${name}: ${a.description} NO ejecuta nada — muestra una tarjeta de confirmación al usuario.${a.params && Object.keys(a.params).length ? ` (parámetros: ${Object.keys(a.params).join(', ')})` : ''}`);
+  }
+  return `
+
+No tienes tool calling nativo. Cuando necesites ejecutar un diagnóstico, responde ÚNICAMENTE con un bloque JSON de una sola línea, sin texto antes ni después, con esta forma exacta:
+{"tool":"nombre_diagnostico","args":{}}
+
+Cuando ya tengas suficiente información para responder al usuario, responde con texto normal — nunca mezcles el JSON de petición con prosa en el mismo mensaje. Catálogo disponible:
+${lines.join('\n')}`;
+}
+
+// Extrae objetos JSON balanceados que sigan a "propose_action" en el texto.
+// Un regex no sirve: `"params":{}` cierra la primera llave y trunca el JSON.
+function extractTextProposals(text) {
+  const out = [];
+  let from = 0;
+  while (true) {
+    const at = text.indexOf('propose_action', from);
+    if (at < 0) break;
+    const open = text.indexOf('{', at);
+    if (open < 0) break;
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = open; i < text.length; i++) {
+      const ch = text[i];
+      if (esc) { esc = false; continue; }
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end < 0) break;
+    const raw = text.slice(at, end + 1);
+    try {
+      const parsed = JSON.parse(text.slice(open, end + 1));
+      if (parsed && parsed.action) out.push({ parsed, raw });
+    } catch (e) {}
+    from = end + 1;
+  }
+  return out;
+}
+
+// Borra la sintaxis cruda del texto visible, incluido el envoltorio markdown
+// de imagen/enlace `![x](propose_action{...})` con el que la envuelven algunos
+// modelos, y los paréntesis sueltos que puedan quedar.
+function stripProposalSyntax(text, tp) {
+  const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return text
+    .replace(new RegExp('!?\\[[^\\]]*\\]\\(\\s*' + esc(tp.raw) + '\\s*\\)', 'g'), '')
+    .replace(new RegExp('\\(\\s*' + esc(tp.raw) + '\\s*\\)', 'g'), '')
+    .replace(tp.raw, '');
+}
+
+function safeParseArgs(a) {
+  if (a == null) return {};
+  if (typeof a === 'object') return a;
+  try { const v = JSON.parse(a); return typeof v === 'object' && v ? v : {}; } catch (e) { return {}; }
+}
+
+function buildOllamaMessages(convo, useTools) {
+  return convo.map(m => {
+    if (m.role === 'tool') {
+      return useTools ? { role: 'tool', name: m.name, content: m.content } : { role: 'user', content: `[RESULTADO DEL DIAGNÓSTICO "${m.name}"]\n${m.content}` };
+    }
+    if (m.role === 'assistant' && m.tool_calls) return { role: 'assistant', content: m.content || '', tool_calls: m.tool_calls };
+    return { role: m.role, content: m.content };
+  });
+}
+
+let chatRunning = false;
+let chatAbortCtrl = null;
+
+async function runOllamaTurn(model, systemPrompt, convo) {
+  const useTools = supportsToolCalling(model);
+  const seenCalls = new Map();
+  let hops = 0;
+  let finalText = '';
+
+  while (true) {
+    hops++;
+    const forceFinal = hops > MAX_TOOL_HOPS;
+    if (forceFinal) convo.push({ role: 'user', content: 'Has alcanzado el límite de diagnósticos disponibles para esta pregunta. Responde ahora con tu conclusión usando la información que ya tienes — no puedes pedir más diagnósticos.' });
+    const useToolsThisCall = useTools && !forceFinal;
+
+    const body = {
+      model,
+      messages: [{ role: 'system', content: systemPrompt }, ...buildOllamaMessages(convo, useToolsThisCall)],
+      stream: true,
+      ...(useToolsThisCall ? { tools: buildToolsSchema() } : {}),
+    };
+
+    let assistantText = '';
+    let toolCalls = null;
+    chatAbortCtrl = new AbortController();
+    let res;
+    try {
+      res = await fetch(OLLAMA_BASE + '/api/chat', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: chatAbortCtrl.signal,
+      });
+    } catch (e) {
+      sendSafe('ollama-chat-chunk', { type: 'error', error: e.name === 'AbortError' ? 'Generación cancelada' : ('No se pudo conectar con Ollama: ' + e.message) });
+      return null;
+    }
+    if (!res.ok || !res.body) {
+      let txt = ''; try { txt = await res.text(); } catch (e) {}
+      sendSafe('ollama-chat-chunk', { type: 'error', error: `Ollama devolvió un error (${res.status}): ${txt.slice(0, 300)}` });
+      return null;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    let streamDone = false;
+    try {
+      while (!streamDone) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 1);
+          if (!line) continue;
+          let obj; try { obj = JSON.parse(line); } catch (e) { continue; }
+          if (obj.message) {
+            if (obj.message.content) {
+              assistantText += obj.message.content;
+              if (useToolsThisCall) sendSafe('ollama-chat-chunk', { type: 'token', text: obj.message.content });
+            }
+            if (obj.message.tool_calls && obj.message.tool_calls.length) toolCalls = obj.message.tool_calls;
+          }
+          if (obj.done) streamDone = true;
+        }
+      }
+    } catch (e) {
+      if (e.name === 'AbortError') { sendSafe('ollama-chat-chunk', { type: 'error', error: 'Generación cancelada' }); return null; }
+      sendSafe('ollama-chat-chunk', { type: 'error', error: 'Se perdió la conexión con Ollama durante la respuesta' });
+      return null;
+    } finally { chatAbortCtrl = null; }
+
+    // Respaldo: algunos modelos (visto con qwen2.5) usan tool-calling para los
+    // diagnósticos pero escriben propose_action como TEXTO en vez de invocarla
+    // — p.ej. `![Propuesta](propose_action{"action":"flush_dns",...})`. Sin
+    // esto, la propuesta se quedaba como texto crudo y la tarjeta de
+    // confirmación nunca aparecía. Se extrae del texto y se limpia.
+    let textProposals = [];
+    if (assistantText.includes('propose_action')) {
+      textProposals = extractTextProposals(assistantText);
+      for (const tp of textProposals) assistantText = stripProposalSyntax(assistantText, tp);
+      assistantText = assistantText.replace(/\n{3,}/g, '\n\n').trim();
+    }
+
+    // Camino JSON (sin tool-calling nativo): decide DESPUÉS de tener el texto
+    // completo si es una petición de herramienta o una respuesta normal —
+    // nunca se envía como texto en vivo hasta saber cuál de las dos es.
+    let jsonToolCall = null;
+    if (!useToolsThisCall) {
+      const trimmed = assistantText.trim();
+      if (/^\{[\s\S]*\}$/.test(trimmed) && /"tool"\s*:\s*"[a-z_]+"/i.test(trimmed)) {
+        try { const parsed = JSON.parse(trimmed); if (parsed && typeof parsed.tool === 'string') jsonToolCall = parsed; } catch (e) {}
+      }
+      if (!jsonToolCall && trimmed) sendSafe('ollama-chat-chunk', { type: 'token', text: assistantText });
+    }
+
+    const requests = toolCalls
+      ? toolCalls.map(tc => ({ name: tc.function.name, args: safeParseArgs(tc.function.arguments) }))
+      : (jsonToolCall ? [{ name: jsonToolCall.tool, args: jsonToolCall.args || {} }] : []);
+
+    // Las propuestas escritas como texto se materializan aquí, tanto si el
+    // turno termina como si sigue pidiendo diagnósticos.
+    for (const tp of textProposals) proposeAction(tp.parsed.action, tp.parsed.params, tp.parsed.reason);
+
+    if (requests.length === 0 || forceFinal) {
+      finalText = jsonToolCall ? '' : assistantText;
+      convo.push({ role: 'assistant', content: finalText });
+      break;
+    }
+
+    convo.push({ role: 'assistant', content: assistantText, tool_calls: toolCalls || undefined });
+
+    for (const req of requests) {
+      const key = req.name + ':' + JSON.stringify(req.args || {});
+      const count = (seenCalls.get(key) || 0) + 1;
+      seenCalls.set(key, count);
+      // Cualquier acción del catálogo (por su nombre) o la forma genérica
+      // propose_action NUNCA se ejecutan aquí: solo generan una propuesta que
+      // el usuario debe confirmar. El modelo recibe "pendiente", nunca "hecho".
+      if (req.name === 'propose_action' || ACTIONS[req.name]) {
+        const isGeneric = req.name === 'propose_action';
+        const actionName = isGeneric ? req.args.action : req.name;
+        const { reason, ...rest } = req.args || {};
+        const actionParams = isGeneric ? req.args.params : rest;
+        const p = proposeAction(actionName, actionParams, reason);
+        convo.push({ role: 'tool', name: req.name, content: p.ok
+          ? `Propuesta mostrada al usuario para que la confirme: "${p.proposal.label}". NO está ejecutada. Espera su decisión; no la des por hecha.`
+          : `ERROR: ${p.error}` });
+        continue;
+      }
+      sendSafe('ollama-diagnostic-event', { type: 'start', name: req.name, args: req.args });
+      let result;
+      if (count > 2) {
+        result = { ok: false, error: `Ya ejecutaste "${req.name}" con esos mismos parámetros ${count - 1} veces en esta conversación. Usa el resultado que ya tienes en vez de repetirlo.` };
+      } else {
+        result = await runDiagnostic(req.name, req.args);
+      }
+      sendSafe('ollama-diagnostic-event', { type: 'result', name: req.name, args: req.args, ok: result.ok, output: result.ok ? result.output : null, error: result.ok ? null : result.error });
+      convo.push({ role: 'tool', name: req.name, content: result.ok ? result.output : `ERROR: ${result.error}` });
+    }
+  }
+
+  return { convo, finalText };
+}
+
+ipcMain.handle('ollama-chat', async (e, { message, model, quick, conversationId } = {}) => {
+  if (chatRunning) return { ok: false, error: 'Ya hay una conversación en curso' };
+  if (!model) return { ok: false, error: 'Selecciona un modelo primero' };
+  chatRunning = true;
+  saveAiPrefs({ lastModel: model });
+
+  const conversations = loadConversations();
+  let conv = conversationId ? conversations.find(c => c.id === conversationId) : null;
+  if (!conv) {
+    conv = { id: crypto.randomUUID(), title: null, createdAt: Date.now(), updatedAt: Date.now(), messages: [] };
+    conversations.push(conv);
+  }
+  const activeId = conv.id;
+  saveConversations(conversations);
+
+  (async () => {
+    try {
+      let convo = conv.messages.slice();
+      const userMsg = quick ? (message || 'Ejecuta un diagnóstico rápido inicial y dime qué ves.') : message;
+      if (!userMsg || !String(userMsg).trim()) { sendSafe('ollama-chat-chunk', { type: 'error', error: 'Mensaje vacío' }); return; }
+      convo.push({ role: 'user', content: userMsg });
+      if (!conv.title) conv.title = conversationTitleFrom(userMsg);
+
+      if (quick) {
+        const quickNames = ['resource_usage_now', 'recent_errors', 'services_status', 'driver_issues'];
+        for (const name of quickNames) {
+          sendSafe('ollama-diagnostic-event', { type: 'start', name, args: {} });
+          const r = await runDiagnostic(name, {});
+          sendSafe('ollama-diagnostic-event', { type: 'result', name, args: {}, ok: r.ok, output: r.ok ? r.output : null, error: r.ok ? null : r.error });
+          convo.push({ role: 'tool', name, content: r.ok ? r.output : `ERROR: ${r.error}` });
+        }
+      }
+
+      const specs = await getSystemSpecs();
+      const systemPrompt = AI_SYSTEM_PROMPT + `\n\nESPECIFICACIONES DEL EQUIPO DEL USUARIO:\n${specs}` + (supportsToolCalling(model) ? '' : buildJsonModeSuffix());
+      const result = await runOllamaTurn(model, systemPrompt, convo);
+      if (result) {
+        conv.messages = result.convo.filter(m => m.role !== 'system');
+        conv.updatedAt = Date.now();
+        const fresh = loadConversations();
+        const idx = fresh.findIndex(c => c.id === activeId);
+        if (idx >= 0) fresh[idx] = conv; else fresh.push(conv);
+        saveConversations(fresh);
+      }
+    } catch (err) {
+      sendSafe('ollama-chat-chunk', { type: 'error', error: err.message || 'Error inesperado en el asistente' });
+    } finally {
+      chatRunning = false;
+      sendSafe('ollama-chat-chunk', { type: 'idle', conversationId: activeId });
+    }
+  })();
+
+  return { ok: true, started: true, conversationId: activeId };
+});
+
+ipcMain.handle('ollama-chat-cancel', async () => {
+  if (!chatAbortCtrl) return { ok: false, error: 'No hay ninguna generación en curso' };
+  chatAbortCtrl.abort();
+  return { ok: true };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
+   AUTO-ACTUALIZACIÓN (electron-updater)
+   ═══════════════════════════════════════════════════════════════════
+   La app se actualiza sin reinstalarla: comprueba GitHub Releases,
+   descarga el instalador nuevo en segundo plano y lo aplica al reiniciar.
+
+   Requisitos para que funcione en producción (ver README):
+     1. `publish` en package.json apuntando a tu repo real.
+     2. Publicar con `npm run release` (necesita GH_TOKEN).
+     3. Solo funciona en build empaquetado — en desarrollo se desactiva
+        porque electron-updater no tiene app-update.yml y lanzaría error.
+   ═══════════════════════════════════════════════════════════════════ */
+let updaterState = { status: 'idle', version: null, error: null, percent: 0 };
+let autoUpdater = null;
+
+function setUpdaterState(patch) {
+  updaterState = { ...updaterState, ...patch };
+  sendSafe('updater-state', updaterState);
+}
+
+function initAutoUpdater() {
+  if (!app.isPackaged) { updaterState = { ...updaterState, status: 'dev' }; return; }
+  try { autoUpdater = require('electron-updater').autoUpdater; } catch (e) { setUpdaterState({ status: 'error', error: 'electron-updater no disponible' }); return; }
+
+  // Descarga manual: primero avisamos al usuario y él decide, en vez de
+  // consumir su ancho de banda sin preguntar.
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => setUpdaterState({ status: 'checking', error: null }));
+  autoUpdater.on('update-available', (info) => setUpdaterState({ status: 'available', version: info && info.version, error: null }));
+  autoUpdater.on('update-not-available', () => setUpdaterState({ status: 'up-to-date', error: null }));
+  autoUpdater.on('download-progress', (p) => setUpdaterState({ status: 'downloading', percent: Math.round((p && p.percent) || 0) }));
+  autoUpdater.on('update-downloaded', (info) => {
+    setUpdaterState({ status: 'downloaded', version: info && info.version, percent: 100 });
+    addHistory('Actualización', `v${info && info.version} descargada`, { status: 'OK' });
+  });
+  autoUpdater.on('error', (err) => {
+    const msg = String((err && err.message) || err || 'error desconocido');
+    // Sin releases publicadas todavía, la comprobación falla con 404: no es
+    // un fallo del usuario, así que se explica en vez de soltar el stack.
+    const friendly = /404|Cannot find latest|ENOTFOUND|ENOENT/i.test(msg)
+      ? 'No hay actualizaciones publicadas todavía (o no hay conexión).'
+      : msg;
+    setUpdaterState({ status: 'error', error: friendly });
+  });
+
+  // Comprobación silenciosa al arrancar, sin bloquear el inicio.
+  setTimeout(() => { autoUpdater.checkForUpdates().catch(() => {}); }, 8000);
+}
+
+ipcMain.handle('updater-get-state', async () => ({ ok: true, state: updaterState }));
+ipcMain.handle('updater-check', async () => {
+  if (!app.isPackaged) return { ok: false, error: 'Las actualizaciones solo funcionan en la app instalada, no en modo desarrollo' };
+  if (!autoUpdater) return { ok: false, error: 'Actualizador no disponible' };
+  try { await autoUpdater.checkForUpdates(); return { ok: true }; }
+  catch (e) { return { ok: false, error: e.message || 'No se pudo comprobar' }; }
+});
+ipcMain.handle('updater-download', async () => {
+  if (!autoUpdater) return { ok: false, error: 'Actualizador no disponible' };
+  try { autoUpdater.downloadUpdate(); return { ok: true }; }
+  catch (e) { return { ok: false, error: e.message || 'No se pudo descargar' }; }
+});
+ipcMain.handle('updater-install', async () => {
+  if (!autoUpdater) return { ok: false, error: 'Actualizador no disponible' };
+  app.isQuiting = true;
+  setImmediate(() => autoUpdater.quitAndInstall(false, true));
+  return { ok: true };
+});
+
+/* ═══════════════════════════════════════════════════════════════════
    HISTORY API
    ═══════════════════════════════════════════════════════════════════ */
 ipcMain.handle('get-history', async () => loadHistory());
@@ -2015,6 +2697,7 @@ app.whenReady().then(async () => {
   }
   createTray();
   createWindow();
+  initAutoUpdater();
 });
 
 app.on('window-all-closed', () => app.quit());

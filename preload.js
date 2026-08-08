@@ -79,4 +79,28 @@ contextBridge.exposeInMainWorld('electronAPI', {
   applyGameProfile:     (game, category) => ipcRenderer.invoke('apply-game-profile', game, category),
   revertGameProfile:    ()               => ipcRenderer.invoke('revert-game-profile'),
   getActiveGameProfile: ()               => ipcRenderer.invoke('get-active-game-profile'),
+
+  // auto-actualización
+  updaterGetState: () => ipcRenderer.invoke('updater-get-state'),
+  updaterCheck:    () => ipcRenderer.invoke('updater-check'),
+  updaterDownload: () => ipcRenderer.invoke('updater-download'),
+  updaterInstall:  () => ipcRenderer.invoke('updater-install'),
+  onUpdaterState:  (cb) => { const h = (_e, s) => cb(s); ipcRenderer.on('updater-state', h); return () => ipcRenderer.removeListener('updater-state', h); },
+
+  // asistente IA (Ollama local)
+  ollamaCheck:        ()                                   => ipcRenderer.invoke('ollama-check'),
+  ollamaListModels:   ()                                   => ipcRenderer.invoke('ollama-list-models'),
+  ollamaChat:         (message, model, quick, conversationId) => ipcRenderer.invoke('ollama-chat', { message, model, quick, conversationId }),
+  ollamaCancelChat:   ()                                   => ipcRenderer.invoke('ollama-chat-cancel'),
+  ollamaListConversations:  ()   => ipcRenderer.invoke('ollama-list-conversations'),
+  ollamaGetConversation:    (id) => ipcRenderer.invoke('ollama-get-conversation', id),
+  ollamaDeleteConversation: (id) => ipcRenderer.invoke('ollama-delete-conversation', id),
+  ollamaClearHistory: ()                      => ipcRenderer.invoke('ollama-clear-history'),
+  ollamaGetPrefs:     ()                      => ipcRenderer.invoke('ollama-get-prefs'),
+  ollamaSetPrefs:     (patch)                 => ipcRenderer.invoke('ollama-set-prefs', patch),
+  ollamaConfirmAction: (id) => ipcRenderer.invoke('ollama-confirm-action', id),
+  ollamaRejectAction:  (id) => ipcRenderer.invoke('ollama-reject-action', id),
+  onOllamaChatChunk:      (cb) => { const h = (_e, c) => cb(c); ipcRenderer.on('ollama-chat-chunk', h); return () => ipcRenderer.removeListener('ollama-chat-chunk', h); },
+  onOllamaDiagnosticEvent:(cb) => { const h = (_e, c) => cb(c); ipcRenderer.on('ollama-diagnostic-event', h); return () => ipcRenderer.removeListener('ollama-diagnostic-event', h); },
+  onOllamaActionProposal: (cb) => { const h = (_e, c) => cb(c); ipcRenderer.on('ollama-action-proposal', h); return () => ipcRenderer.removeListener('ollama-action-proposal', h); },
 });
