@@ -1416,7 +1416,7 @@ function OrbitalMenu({onSelect}){
         <div style={{display:'flex',flexDirection:'column',alignItems:'center',animation:'floatY 7s ease-in-out infinite'}}>
           <pre style={{fontFamily:'var(--mono)',fontSize:compact?9:12,lineHeight:1.5,color:'#fff',userSelect:'none',margin:0,textAlign:'center',whiteSpace:'pre',fontWeight:700}}>{SKULL_LINES.map((l,i)=>(i>=2&&i<=3&&!eyeOpen?l.replace(/████/g,'░░░░'):l).trim()).join('\n')}</pre>
           <div style={{marginTop:compact?6:10,fontSize:11,fontWeight:700,letterSpacing:4,color:'#fff',textTransform:'uppercase',textAlign:'center'}}>Vokoptimizer</div>
-          <div style={{fontSize:9,color:'#6e6e6e',letterSpacing:3,marginTop:3,textTransform:'uppercase'}}>v4.2.0 · System Optimizer</div>
+          <div style={{fontSize:9,color:'#6e6e6e',letterSpacing:3,marginTop:3,textTransform:'uppercase'}}>v4.2.1 · System Optimizer</div>
         </div>
       </div>
       {TOOLS.map((tool,i)=>{const deg=((i/N)*360+angle)%360,rad=deg*Math.PI/180,x=Rx*Math.cos(rad),y=Ry*Math.sin(rad),depth=(Math.sin(rad)+1)/2,isH=hov===tool.id;const sz=compact?46:58;return(
@@ -1438,7 +1438,7 @@ function OrbitalMenu({onSelect}){
 }
 
 /* ── Intro ─────────────────────────── */
-const BOOT_LINES=['> VOKOPTIMIZER v4.2.0','> Inicializando kernel de optimizacion...','  [OK] Escaneo real de disco','  [OK] Gestor de servicios','  [OK] Gestor de arranque','  [OK] Optimizacion CPU/RAM','  [OK] Mantenimiento y registro','  [OK] Monitor de recursos','> SISTEMA LISTO'];
+const BOOT_LINES=['> VOKOPTIMIZER v4.2.1','> Inicializando kernel de optimizacion...','  [OK] Escaneo real de disco','  [OK] Gestor de servicios','  [OK] Gestor de arranque','  [OK] Optimizacion CPU/RAM','  [OK] Mantenimiento y registro','  [OK] Monitor de recursos','> SISTEMA LISTO'];
 function Intro({onDone}){
   const [rev,setRev]=useState(0);const [eyeOpen,setEyeOpen]=useState(true);const [bl,setBl]=useState(-1);const [bc,setBc]=useState(0);const [sp,setSp]=useState(false);const [ex,setEx]=useState(false);
   useEffect(()=>{if(rev>=SKULL_LINES.length)return;const id=setTimeout(()=>setRev(r=>r+1),60);return()=>clearTimeout(id);},[rev]);
