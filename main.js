@@ -2314,6 +2314,63 @@ function safeParseArgs(a) {
   try { const v = JSON.parse(a); return typeof v === 'object' && v ? v : {}; } catch (e) { return {}; }
 }
 
+// Algunos modelos (visto con qwen2.5 en ciertas versiones de Ollama) NO invocan
+// los diagnósticos por el canal estructurado `tool_calls`: los escriben como
+// TEXTO dentro de la respuesta, con su propia plantilla —
+//   /BranchCommand{"name": "disk_health", "arguments": {}}
+//   <tool_call>{"name": "services_status", "arguments": {}}</tool_call>
+//   {"tool": "recent_errors", "args": {"hours": 24}}
+// Sin esto, la llamada se quedaba como texto crudo y el diagnóstico nunca se
+// ejecutaba (el usuario veía el JSON y no pasaba nada). Aquí se rescatan del
+// texto: se localiza cada objeto JSON balanceando llaves, se acepta solo si su
+// nombre está en el catálogo cerrado, y se devuelve junto al fragmento crudo
+// (incluido el prefijo tipo /BranchCommand) para poder limpiarlo del texto.
+function extractLeakedDiagnostics(text) {
+  const out = [];
+  const names = new Set(Object.keys(DIAGNOSTICS));
+  let from = 0;
+  while (from < text.length) {
+    const open = text.indexOf('{', from);
+    if (open < 0) break;
+    let depth = 0, inStr = false, esc = false, end = -1;
+    for (let i = open; i < text.length; i++) {
+      const ch = text[i];
+      if (esc) { esc = false; continue; }
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end < 0) break;
+    let parsed = null;
+    try { parsed = JSON.parse(text.slice(open, end + 1)); } catch (e) {}
+    if (parsed && typeof parsed === 'object') {
+      const name = typeof parsed.name === 'string' ? parsed.name
+        : (typeof parsed.tool === 'string' ? parsed.tool : null);
+      if (name && names.has(name)) {
+        const rawArgs = parsed.arguments != null ? parsed.arguments : parsed.args;
+        const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {};
+        // Recupera el prefijo pegado al `{` (p.ej. `/BranchCommand`, `<tool_call>`)
+        // para borrarlo también del texto visible.
+        let rawStart = open;
+        const before = text.slice(Math.max(0, open - 24), open);
+        const mPref = before.match(/(\/[A-Za-z_][\w-]*|<tool_call>|<function[^>]*>|<｜tool▁call▁begin｜>)\s*$/);
+        if (mPref) rawStart = open - mPref[0].length;
+        out.push({ name, args, raw: text.slice(rawStart, end + 1) });
+      }
+    }
+    from = end + 1;
+  }
+  return out;
+}
+
+// Marcadores con los que los modelos abren una llamada escrita como texto.
+// Sirven para CORTAR el streaming en vivo en cuanto aparecen, de modo que el
+// usuario nunca vea el JSON crudo apareciendo letra a letra (la extracción de
+// arriba es la garantía de corrección; esto es solo cosmético).
+const TOOLCALL_STREAM_MARKERS = ['/BranchCommand', '<tool_call>', '<function', '<｜tool▁call▁begin｜>'];
+
 function buildOllamaMessages(convo, useTools) {
   return convo.map(m => {
     if (m.role === 'tool') {
@@ -2348,6 +2405,7 @@ async function runOllamaTurn(model, systemPrompt, convo) {
 
     let assistantText = '';
     let toolCalls = null;
+    let streamCut = false; // true una vez que aparece un marcador de llamada-como-texto
     chatAbortCtrl = new AbortController();
     let res;
     try {
@@ -2382,8 +2440,22 @@ async function runOllamaTurn(model, systemPrompt, convo) {
           let obj; try { obj = JSON.parse(line); } catch (e) { continue; }
           if (obj.message) {
             if (obj.message.content) {
+              const prevLen = assistantText.length;
               assistantText += obj.message.content;
-              if (useToolsThisCall) sendSafe('ollama-chat-chunk', { type: 'token', text: obj.message.content });
+              // Solo el camino nativo streamea en vivo. En cuanto asoma un
+              // marcador de llamada-como-texto se corta: se envía la prosa
+              // previa al marcador y se deja de emitir el resto de este turno.
+              if (useToolsThisCall && !streamCut) {
+                let cut = -1;
+                for (const m of TOOLCALL_STREAM_MARKERS) { const p = assistantText.indexOf(m); if (p >= 0 && (cut < 0 || p < cut)) cut = p; }
+                if (cut < 0) {
+                  sendSafe('ollama-chat-chunk', { type: 'token', text: obj.message.content });
+                } else {
+                  const visible = cut > prevLen ? assistantText.slice(prevLen, cut) : '';
+                  if (visible) sendSafe('ollama-chat-chunk', { type: 'token', text: visible });
+                  streamCut = true;
+                }
+              }
             }
             if (obj.message.tool_calls && obj.message.tool_calls.length) toolCalls = obj.message.tool_calls;
           }
@@ -2408,33 +2480,46 @@ async function runOllamaTurn(model, systemPrompt, convo) {
       assistantText = assistantText.replace(/\n{3,}/g, '\n\n').trim();
     }
 
-    // Camino JSON (sin tool-calling nativo): decide DESPUÉS de tener el texto
-    // completo si es una petición de herramienta o una respuesta normal —
-    // nunca se envía como texto en vivo hasta saber cuál de las dos es.
-    let jsonToolCall = null;
-    if (!useToolsThisCall) {
-      const trimmed = assistantText.trim();
-      if (/^\{[\s\S]*\}$/.test(trimmed) && /"tool"\s*:\s*"[a-z_]+"/i.test(trimmed)) {
-        try { const parsed = JSON.parse(trimmed); if (parsed && typeof parsed.tool === 'string') jsonToolCall = parsed; } catch (e) {}
-      }
-      if (!jsonToolCall && trimmed) sendSafe('ollama-chat-chunk', { type: 'token', text: assistantText });
+    // Diagnósticos que el modelo escribió como TEXTO en vez de invocarlos por
+    // el canal estructurado (ver extractLeakedDiagnostics). Se ejecutan igual
+    // y se quitan del texto visible para que no quede el JSON crudo.
+    const leaked = extractLeakedDiagnostics(assistantText);
+    if (leaked.length) {
+      for (const lk of leaked) assistantText = assistantText.split(lk.raw).join('');
+      assistantText = assistantText.replace(/<\/?tool_call>|<\/?function[^>]*>|<｜tool▁call▁end｜>/g, '').replace(/\n{3,}/g, '\n\n').trim();
     }
 
-    const requests = toolCalls
-      ? toolCalls.map(tc => ({ name: tc.function.name, args: safeParseArgs(tc.function.arguments) }))
-      : (jsonToolCall ? [{ name: jsonToolCall.tool, args: jsonToolCall.args || {} }] : []);
+    // Camino sin tool-calling nativo: el texto no se streameó en vivo. Si tras
+    // quitar las llamadas queda prosa, se envía ahora de una vez.
+    if (!useToolsThisCall && assistantText.trim()) {
+      sendSafe('ollama-chat-chunk', { type: 'token', text: assistantText });
+    }
+
+    // Unifica peticiones del canal estructurado + las rescatadas del texto,
+    // sin duplicar (mismo nombre y mismos argumentos).
+    const requests = [];
+    const seenReq = new Set();
+    const pushReq = (name, args) => { const k = name + ':' + JSON.stringify(args || {}); if (!seenReq.has(k)) { seenReq.add(k); requests.push({ name, args: args || {} }); } };
+    if (toolCalls) for (const tc of toolCalls) pushReq(tc.function.name, safeParseArgs(tc.function.arguments));
+    for (const lk of leaked) pushReq(lk.name, lk.args);
 
     // Las propuestas escritas como texto se materializan aquí, tanto si el
     // turno termina como si sigue pidiendo diagnósticos.
     for (const tp of textProposals) proposeAction(tp.parsed.action, tp.parsed.params, tp.parsed.reason);
 
     if (requests.length === 0 || forceFinal) {
-      finalText = jsonToolCall ? '' : assistantText;
+      finalText = assistantText;
       convo.push({ role: 'assistant', content: finalText });
       break;
     }
 
-    convo.push({ role: 'assistant', content: assistantText, tool_calls: toolCalls || undefined });
+    // Si las llamadas venían como texto (no por el canal estructurado), se
+    // sintetiza un tool_calls en el mensaje del asistente: así el mensaje
+    // 'tool' con el resultado tiene un tool_calls previo válido y la plantilla
+    // del modelo no se rompe en el siguiente turno.
+    const assistantToolCalls = toolCalls
+      || (leaked.length ? requests.map(r => ({ function: { name: r.name, arguments: JSON.stringify(r.args || {}) } })) : undefined);
+    convo.push({ role: 'assistant', content: assistantText, tool_calls: assistantToolCalls });
 
     for (const req of requests) {
       const key = req.name + ':' + JSON.stringify(req.args || {});
