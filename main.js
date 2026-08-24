@@ -483,7 +483,7 @@ Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object { $na
 
 async function setServiceState(name, action) {
   if (!IS_WIN) return { ok: false };
-  if (!SVC_META[name]) return { ok: false, error: 'Servicio no permitido' };
+  if (!SVC_META[name]) return { ok: false, error: `El servicio "${name}" no está entre los que la app puede gestionar. Solo puede iniciar/detener: ${Object.keys(SVC_META).join(', ')}. Para cualquier otro servicio, el usuario debe usar el módulo de Servicios de Windows.` };
   let cmd = '';
   if (action === 'start') cmd = `Start-Service -Name '${name}' -ErrorAction Stop`;
   else if (action === 'stop') cmd = `Stop-Service -Name '${name}' -Force -ErrorAction Stop`;
@@ -2103,7 +2103,8 @@ const AI_SYSTEM_PROMPT = `Eres el asistente de diagnóstico integrado en Vokopti
 REGLAS DURAS:
 - Solo puedes pedir información ejecutando diagnósticos del catálogo cerrado que se te da. NUNCA pidas un comando libre ni un diagnóstico que no esté en la lista.
 - Todos los diagnósticos son de solo lectura — no modifican nada del sistema.
-- Para acciones que SÍ modifican el sistema tienes herramientas propias (${ACTIONS_LIST}). Llamarlas NO las ejecuta: solo muestra al usuario una tarjeta de confirmación y él decide. Nunca des una acción por ejecutada hasta que te llegue su resultado.
+- Para acciones que SÍ modifican el sistema tienes herramientas propias (${ACTIONS_LIST}). Llamarlas NO las ejecuta: solo muestra al usuario una tarjeta de confirmación con botones, y él decide ahí. Nunca des una acción por ejecutada hasta que te llegue su resultado.
+- El usuario confirma o rechaza cada acción con los BOTONES de la tarjeta, no escribiendo en el chat. Si tras proponer una acción el usuario escribe "confirmo", "sí" o similar, NO vuelvas a proponer la misma acción: recuérdale que pulse el botón de la tarjeta. Propón cada acción UNA sola vez.
 - Si la acción que hace falta no está en esa lista, explícasela al usuario y dile qué módulo de Vokoptimizer abrir.
 - Ya tienes las especificaciones del equipo más abajo: NO se las preguntes al usuario.
 - No pidas dos veces el mismo diagnóstico con los mismos parámetros salvo que el usuario te lo pida explícitamente.
@@ -2155,12 +2156,20 @@ function buildToolsSchema() {
   // VACÍA. Registrando los nombres reales, la llamada es válida. Que se llamen
   // igual que la acción no implica ejecución: main.js siempre las convierte en
   // propuesta pendiente de confirmación del usuario.
+  // Los servicios que la app puede iniciar/detener son SOLO los del mapa
+  // curado SVC_META. Se los damos al modelo por su nombre exacto para que no
+  // proponga iniciar/detener servicios fuera de la lista (p.ej. edgeupdate,
+  // gpsvc), que la capa de acción rechaza por seguridad.
+  const manageableServices = Object.entries(SVC_META).map(([n, m]) => `${n} (${m.label})`).join(', ');
   for (const [name, a] of Object.entries(ACTIONS)) {
+    const svcNote = (name === 'start_service' || name === 'stop_service')
+      ? ` El parámetro "name" DEBE ser uno de estos nombres exactos y ningún otro: ${manageableServices}. Si el servicio que quieres tocar no está en esta lista, NO uses esta acción: dile al usuario que lo haga desde el módulo de Servicios de Windows.`
+      : '';
     diagTools.push({
       type: 'function',
       function: {
         name,
-        description: `${a.description} IMPORTANTE: esto NO ejecuta la acción — muestra al usuario una tarjeta de confirmación y él decide. No la des por hecha.`,
+        description: `${a.description}${svcNote} IMPORTANTE: esto NO ejecuta la acción — muestra al usuario una tarjeta de confirmación y él decide. No la des por hecha.`,
         parameters: {
           type: 'object',
           properties: {
@@ -2254,8 +2263,12 @@ ipcMain.handle('ollama-reject-action', async (e, id) => { pendingActions.delete(
 
 function buildJsonModeSuffix() {
   const lines = Object.entries(DIAGNOSTICS).map(([name, d]) => `- ${name}: ${d.description}${d.params ? ` (parámetros opcionales: ${Object.keys(d.params).join(', ')})` : ''}`);
+  const manageableServices = Object.entries(SVC_META).map(([n, m]) => `${n} (${m.label})`).join(', ');
   for (const [name, a] of Object.entries(ACTIONS)) {
-    lines.push(`- ${name}: ${a.description} NO ejecuta nada — muestra una tarjeta de confirmación al usuario.${a.params && Object.keys(a.params).length ? ` (parámetros: ${Object.keys(a.params).join(', ')})` : ''}`);
+    const svcNote = (name === 'start_service' || name === 'stop_service')
+      ? ` El "name" DEBE ser uno de: ${manageableServices}. Si no está en esa lista, no uses esta acción; dile al usuario que lo haga desde el módulo de Servicios.`
+      : '';
+    lines.push(`- ${name}: ${a.description}${svcNote} NO ejecuta nada — muestra una tarjeta de confirmación al usuario.${a.params && Object.keys(a.params).length ? ` (parámetros: ${Object.keys(a.params).join(', ')})` : ''}`);
   }
   return `
 
